@@ -365,10 +365,19 @@ class VIEW3D_PT_MaterialManager(Panel):
     bl_category = "UV Tools"  # 保持与主面板相同分类
     bl_order = 3  # 显示在主面板下方
 
+    def draw_header(self, context):
+        layout = self.layout
+        layout.operator("material.reload_all_textures", text="", icon='FILE_REFRESH', emboss=False)
+
     def draw(self, context):
         layout = self.layout
         props = context.scene.um_props
         
+        # 0. 菜单最顶上一键刷新全部材质贴图
+        top_row = layout.row(align=True)
+        top_row.scale_y = 1.15
+        top_row.operator("material.reload_all_textures", text="刷新全部材质贴图", icon='FILE_REFRESH')
+
         # 主容器
         main_box = layout.box()
         
