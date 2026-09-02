@@ -1,0 +1,23 @@
+﻿# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+
+# Editor & IDE configs
+.vscode/
+.idea/
+.history/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Temporary and backup files
+*.blend@
+*.blend1
+*.blend2
