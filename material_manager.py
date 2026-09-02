@@ -581,6 +581,61 @@ class MATERIAL_OT_OpenTemplateLibraryFolder(Operator):
             return {'CANCELLED'}
 
 
+class MATERIAL_OT_ReloadAllTextures(Operator):
+    """一键刷新工程中所有材质的图像贴图和材质球预览"""
+    bl_idname = "material.reload_all_textures"
+    bl_label = "刷新全部材质贴图"
+    bl_description = "一键重载所有材质使用的外部图像贴图文件并刷新材质球预览 (相当于批量 Alt+R)"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        reloaded_images = set()
+        
+        # 1. 刷新所有图像数据块
+        for img in bpy.data.images:
+            if img.source in {'FILE', 'SEQUENCE', 'TILED'}:
+                try:
+                    img.reload()
+                    reloaded_images.add(img.name)
+                except Exception as e:
+                    print(f"刷新贴图 {img.name} 失败: {e}")
+
+        # 2. 刷新所有材质的着色器节点并触发更新
+        mat_count = 0
+        for mat in bpy.data.materials:
+            if mat.use_nodes and mat.node_tree:
+                for node in mat.node_tree.nodes:
+                    if node.type == 'TEX_IMAGE' and node.image:
+                        if node.image.name not in reloaded_images:
+                            try:
+                                node.image.reload()
+                                reloaded_images.add(node.image.name)
+                            except Exception:
+                                pass
+            mat.update_tag()
+            if hasattr(mat, 'preview_ensure'):
+                mat.preview_ensure()
+            if mat.preview:
+                try:
+                    mat.preview.reload()
+                except Exception:
+                    pass
+            mat_count += 1
+
+        # 3. 强制视图层和所有 3D 视图/图像/着色器编辑器重绘
+        if context.view_layer:
+            context.view_layer.update()
+            
+        for window in context.window_manager.windows:
+            for area in window.screen.areas:
+                if area.type in {'VIEW_3D', 'IMAGE_EDITOR', 'NODE_EDITOR', 'PROPERTIES'}:
+                    area.tag_redraw()
+
+        msg = f"已成功刷新 {len(reloaded_images)} 张贴图与 {mat_count} 个材质预览"
+        self.report({'INFO'}, msg)
+        return {'FINISHED'}
+
+
 class MATERIAL_PT_TemplateLibraryPopover(bpy.types.Panel):
     """材质模板库气泡弹窗，支持单项选择与删除"""
     bl_idname = "MATERIAL_PT_TemplateLibraryPopover"
@@ -1361,6 +1416,7 @@ def register():
     bpy.utils.register_class(MATERIAL_OT_ExportTemplateLibrary)
     bpy.utils.register_class(MATERIAL_OT_ImportTemplateLibrary)
     bpy.utils.register_class(MATERIAL_OT_OpenTemplateLibraryFolder)
+    bpy.utils.register_class(MATERIAL_OT_ReloadAllTextures)
     bpy.utils.register_class(MATERIAL_MT_TemplateLibraryMenu)
     bpy.utils.register_class(MATERIAL_PT_TemplateLibraryPopover)
     bpy.utils.register_class(MATERIAL_OT_SyncShaderData)
@@ -1392,6 +1448,7 @@ def unregister():
     bpy.utils.unregister_class(MATERIAL_OT_SyncShaderData)
     bpy.utils.unregister_class(MATERIAL_PT_TemplateLibraryPopover)
     bpy.utils.unregister_class(MATERIAL_MT_TemplateLibraryMenu)
+    bpy.utils.unregister_class(MATERIAL_OT_ReloadAllTextures)
     bpy.utils.unregister_class(MATERIAL_OT_OpenTemplateLibraryFolder)
     bpy.utils.unregister_class(MATERIAL_OT_ImportTemplateLibrary)
     bpy.utils.unregister_class(MATERIAL_OT_ExportTemplateLibrary)
