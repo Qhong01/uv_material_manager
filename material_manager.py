@@ -106,6 +106,62 @@ class MaterialTemplateManager:
             return False
 
     @classmethod
+    def rename_template(cls, old_name, new_name):
+        """重命名本地材质模板库中的指定材质"""
+        if not old_name or not new_name or old_name == new_name:
+            return False
+        p = cls.get_lib_path()
+        if not os.path.exists(p):
+            return False
+
+        try:
+            with bpy.data.libraries.load(p) as (data_from, _):
+                all_names = [str(n) for n in data_from.materials]
+        except Exception:
+            return False
+
+        if old_name not in all_names:
+            return False
+
+        if new_name in all_names:
+            return False
+
+        mats_to_save = set()
+        names_to_load = []
+        for n in all_names:
+            target_n = new_name if n == old_name else n
+            if target_n in bpy.data.materials:
+                mats_to_save.add(bpy.data.materials[target_n])
+            elif n in bpy.data.materials:
+                mat_in_mem = bpy.data.materials[n]
+                mat_in_mem.name = target_n
+                mats_to_save.add(mat_in_mem)
+            else:
+                names_to_load.append(n)
+
+        if names_to_load:
+            try:
+                with bpy.data.libraries.load(p) as (data_from, data_to):
+                    data_to.materials = list(names_to_load)
+
+                for orig_n, m in zip(names_to_load, data_to.materials):
+                    if not m:
+                        continue
+                    m.name = new_name if orig_n == old_name else orig_n
+                    m.use_fake_user = True
+                    mats_to_save.add(m)
+            except Exception as e:
+                print("加载待重命名模板失败:", e)
+                return False
+
+        try:
+            bpy.data.libraries.write(p, mats_to_save, fake_user=True)
+            return True
+        except Exception as e:
+            print("重命名材质模板库失败:", e)
+            return False
+
+    @classmethod
     def load_single_template(cls, mat_name):
         p = cls.get_lib_path()
         if not os.path.exists(p):
@@ -636,8 +692,81 @@ class MATERIAL_OT_ReloadAllTextures(Operator):
         return {'FINISHED'}
 
 
+class MATERIAL_OT_RenameSourceTemplate(Operator):
+    """修改材质库中模板的名称"""
+    bl_idname = "material.rename_source_template"
+    bl_label = "重命名材质模板"
+    bl_description = "修改此材质模板在本地材质库中的名称"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    old_name: StringProperty(name="原名称", options={'HIDDEN'})
+    new_name: StringProperty(name="新名称", description="输入新的材质模板名称")
+
+    def invoke(self, context, event):
+        self.new_name = self.old_name
+        return context.window_manager.invoke_props_dialog(self, width=320)
+
+    def draw(self, context):
+        layout = self.layout
+        col = layout.column(align=True)
+        col.label(text=f"原名称: {self.old_name}", icon='MATERIAL')
+        col.separator()
+        col.prop(self, "new_name", text="新名称")
+
+    def execute(self, context):
+        new_name_clean = self.new_name.strip()
+        if not new_name_clean:
+            self.report({'WARNING'}, "材质名称不能为空")
+            return {'CANCELLED'}
+
+        if new_name_clean == self.old_name:
+            return {'CANCELLED'}
+
+        existing_templates = MaterialTemplateManager.get_template_names()
+        if new_name_clean in existing_templates:
+            self.report({'ERROR'}, f"材质库中已存在名为 '{new_name_clean}' 的模板")
+            return {'CANCELLED'}
+
+        success = MaterialTemplateManager.rename_template(self.old_name, new_name_clean)
+        if success:
+            if self.old_name in bpy.data.materials and new_name_clean not in bpy.data.materials:
+                try:
+                    bpy.data.materials[self.old_name].name = new_name_clean
+                except Exception:
+                    pass
+
+            if hasattr(context.scene, "um_source_mat_enum") and context.scene.um_source_mat_enum == self.old_name:
+                context.scene.um_source_mat_enum = new_name_clean
+
+            self.report({'INFO'}, f"已成功将材质模板重命名为: {new_name_clean}")
+            
+            for window in context.window_manager.windows:
+                for area in window.screen.areas:
+                    if area.type in {'VIEW_3D', 'PROPERTIES'}:
+                        area.tag_redraw()
+            return {'FINISHED'}
+        else:
+            self.report({'ERROR'}, f"重命名失败: 无法修改 '{self.old_name}'")
+            return {'CANCELLED'}
+
+
+def draw_template_button_context_menu(self, context):
+    """为材质模板按钮提供右键上下文菜单（修改命名、删除）"""
+    btn_op = getattr(context, 'button_operator', None)
+    if btn_op and getattr(btn_op, 'bl_idname', '') == "MATERIAL_OT_load_template_to_source":
+        mat_name = getattr(btn_op, 'template_name', '')
+        if mat_name:
+            layout = self.layout
+            layout.separator()
+            op = layout.operator("material.rename_source_template", text=f"修改材质名称 ({mat_name})", icon='FONT_DATA')
+            op.old_name = mat_name
+            op.new_name = mat_name
+            del_op = layout.operator("material.delete_source_template", text=f"删除此模板 ({mat_name})", icon='TRASH')
+            del_op.template_name = mat_name
+
+
 class MATERIAL_PT_TemplateLibraryPopover(bpy.types.Panel):
-    """材质模板库气泡弹窗，支持单项选择与删除"""
+    """材质模板库气泡弹窗，支持单项选择、右键修改命名与删除"""
     bl_idname = "MATERIAL_PT_TemplateLibraryPopover"
     bl_label = "材质模板库"
     bl_space_type = 'VIEW_3D'
@@ -659,12 +788,17 @@ class MATERIAL_PT_TemplateLibraryPopover(bpy.types.Panel):
             prev = mat.preview_ensure() if (mat and hasattr(mat, 'preview_ensure')) else (mat.preview if mat else None)
             icon_val = prev.icon_id if prev else 0
             
-            # 左侧载入按钮（占满剩余宽度）
+            # 左侧载入按钮（占满剩余宽度，支持右键菜单修改命名）
             if icon_val:
                 op = row.operator("material.load_template_to_source", text=f"★ {name}", icon_value=icon_val)
             else:
                 op = row.operator("material.load_template_to_source", text=f"★ {name}", icon='MATERIAL')
             op.template_name = name
+
+            # 重命名按钮（快捷修改命名）
+            rename_op = row.operator("material.rename_source_template", text="", icon='FONT_DATA', emboss=False)
+            rename_op.old_name = name
+            rename_op.new_name = name
 
             # 右侧删除 X 按钮（无边框紧凑对齐）
             del_op = row.operator("material.delete_source_template", text="", icon='X', emboss=False)
@@ -1412,6 +1546,7 @@ def register():
     bpy.utils.register_class(MATERIAL_OT_CreateNew)
     bpy.utils.register_class(MATERIAL_OT_SaveSourceTemplate)
     bpy.utils.register_class(MATERIAL_OT_DeleteSourceTemplate)
+    bpy.utils.register_class(MATERIAL_OT_RenameSourceTemplate)
     bpy.utils.register_class(MATERIAL_OT_LoadTemplateToSource)
     bpy.utils.register_class(MATERIAL_OT_ExportTemplateLibrary)
     bpy.utils.register_class(MATERIAL_OT_ImportTemplateLibrary)
@@ -1431,9 +1566,18 @@ def register():
     bpy.utils.register_class(MATERIAL_OT_ItemActionsPopup)
     bpy.utils.register_class(MATERIAL_UL_CustomList)
     bpy.utils.register_class(MATERIAL_OT_UpdateList)
+    
+    if hasattr(bpy.types, "UI_MT_button_context_menu"):
+        bpy.types.UI_MT_button_context_menu.append(draw_template_button_context_menu)
 
 # 注销函数
 def unregister():
+    if hasattr(bpy.types, "UI_MT_button_context_menu"):
+        try:
+            bpy.types.UI_MT_button_context_menu.remove(draw_template_button_context_menu)
+        except Exception:
+            pass
+
     bpy.utils.unregister_class(MATERIAL_OT_UpdateList)
     bpy.utils.unregister_class(MATERIAL_UL_CustomList)
     bpy.utils.unregister_class(MATERIAL_OT_ItemActionsPopup)
@@ -1453,6 +1597,7 @@ def unregister():
     bpy.utils.unregister_class(MATERIAL_OT_ImportTemplateLibrary)
     bpy.utils.unregister_class(MATERIAL_OT_ExportTemplateLibrary)
     bpy.utils.unregister_class(MATERIAL_OT_LoadTemplateToSource)
+    bpy.utils.unregister_class(MATERIAL_OT_RenameSourceTemplate)
     bpy.utils.unregister_class(MATERIAL_OT_DeleteSourceTemplate)
     bpy.utils.unregister_class(MATERIAL_OT_SaveSourceTemplate)
     bpy.utils.unregister_class(MATERIAL_OT_CreateNew)
