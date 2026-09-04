@@ -7,13 +7,181 @@ from bpy.props import IntProperty
 from bpy.app.handlers import persistent
 
 # =========================================================================
-# UV层自动同步引擎 (当活动物体切换UV层时，自动同步所有选中物体)
+# UV层独立专属缝合边管理器 (Per-UV-Layer Seams Manager)
+# =========================================================================
+
+class UVSeamsManager:
+    """每个 UV 层独立专属缝合边的存储与切换引擎"""
+
+    @staticmethod
+    def get_current_seams(obj):
+        """获取当前网格当前的缝合边索引列表"""
+        if not obj or obj.type != 'MESH':
+            return []
+        me = obj.data
+        if obj.mode == 'EDIT':
+            bm = bmesh.from_edit_mesh(me)
+            return [e.index for e in bm.edges if e.seam]
+        else:
+            return [e.index for e in me.edges if e.use_seam]
+
+    @staticmethod
+    def set_current_seams(obj, seam_indices):
+        """将指定的缝合边索引应用到网格并即时刷新视口"""
+        if not obj or obj.type != 'MESH':
+            return
+        me = obj.data
+        seam_set = set(seam_indices)
+        if obj.mode == 'EDIT':
+            bm = bmesh.from_edit_mesh(me)
+            for e in bm.edges:
+                e.seam = (e.index in seam_set)
+            bmesh.update_edit_mesh(me)
+        else:
+            for e in me.edges:
+                e.use_seam = (e.index in seam_set)
+            me.update()
+
+    @classmethod
+    def save_seams_for_uv(cls, obj, uv_name=None):
+        """保存指定（或当前活动）UV 层的缝合边"""
+        if not obj or obj.type != 'MESH' or not obj.data.uv_layers:
+            return
+        if uv_name is None:
+            active_uv = obj.data.uv_layers.active
+            if not active_uv:
+                return
+            uv_name = active_uv.name
+
+        me = obj.data
+        current_seams = cls.get_current_seams(obj)
+        try:
+            seams_dict = json.loads(me.get("_uv_seams_dict", "{}"))
+        except Exception:
+            seams_dict = {}
+
+        seams_dict[uv_name] = current_seams
+        me["_uv_seams_dict"] = json.dumps(seams_dict)
+
+    @classmethod
+    def load_seams_for_uv(cls, obj, uv_name=None):
+        """载入指定（或当前活动）UV 层的专属缝合边"""
+        if not obj or obj.type != 'MESH' or not obj.data.uv_layers:
+            return
+        if uv_name is None:
+            active_uv = obj.data.uv_layers.active
+            if not active_uv:
+                return
+            uv_name = active_uv.name
+
+        me = obj.data
+        try:
+            seams_dict = json.loads(me.get("_uv_seams_dict", "{}"))
+        except Exception:
+            seams_dict = {}
+
+        if uv_name in seams_dict:
+            cls.set_current_seams(obj, seams_dict[uv_name])
+        else:
+            # 该层尚未记录过缝合边，将当前缝合边自动存为该层的初始数据
+            current_seams = cls.get_current_seams(obj)
+            seams_dict[uv_name] = current_seams
+            me["_uv_seams_dict"] = json.dumps(seams_dict)
+
+    @classmethod
+    def switch_layer_with_seams(cls, obj, target_index):
+        """切换 UV 层并自动换存专属缝合边"""
+        if not obj or obj.type != 'MESH' or not obj.data.uv_layers:
+            return
+        layers = obj.data.uv_layers
+        if not (0 <= target_index < len(layers)):
+            return
+        if layers.active_index == target_index:
+            return
+
+        old_uv_name = layers.active.name if layers.active else None
+        if old_uv_name:
+            cls.save_seams_for_uv(obj, old_uv_name)
+
+        UVAutoSync.record_active_index(obj.name, target_index)
+        layers.active_index = target_index
+
+        new_uv_name = layers.active.name if layers.active else None
+        if new_uv_name:
+            cls.load_seams_for_uv(obj, new_uv_name)
+
+    @classmethod
+    def generate_seams_from_uv(cls, obj):
+        """从当前活动 UV 层的岛边界自动生成专属缝合边"""
+        if not obj or obj.type != 'MESH' or not obj.data.uv_layers:
+            return 0
+        me = obj.data
+        is_edit = (obj.mode == 'EDIT')
+        if is_edit:
+            bm = bmesh.from_edit_mesh(me)
+        else:
+            bm = bmesh.new()
+            bm.from_mesh(me)
+
+        uv_lay = bm.loops.layers.uv.active
+        if not uv_lay:
+            if not is_edit:
+                bm.free()
+            return 0
+
+        seam_count = 0
+        for edge in bm.edges:
+            if len(edge.link_faces) == 1:
+                edge.seam = True
+                seam_count += 1
+            elif len(edge.link_faces) == 2:
+                f1, f2 = edge.link_faces
+                l1 = next((l for l in f1.loops if l.edge == edge), None)
+                l2 = next((l for l in f2.loops if l.edge == edge), None)
+                if not l1 or not l2:
+                    continue
+                v0, v1 = edge.verts
+                uv1_v0 = l1[uv_lay].uv if l1.vert == v0 else l1.link_loop_next[uv_lay].uv
+                uv1_v1 = l1[uv_lay].uv if l1.vert == v1 else l1.link_loop_next[uv_lay].uv
+                uv2_v0 = l2[uv_lay].uv if l2.vert == v0 else l2.link_loop_next[uv_lay].uv
+                uv2_v1 = l2[uv_lay].uv if l2.vert == v1 else l2.link_loop_next[uv_lay].uv
+
+                if (uv1_v0 - uv2_v0).length > 1e-4 or (uv1_v1 - uv2_v1).length > 1e-4:
+                    edge.seam = True
+                    seam_count += 1
+                else:
+                    edge.seam = False
+            else:
+                edge.seam = True
+                seam_count += 1
+
+        if is_edit:
+            bmesh.update_edit_mesh(me)
+        else:
+            bm.to_mesh(me)
+            bm.free()
+            me.update()
+
+        cls.save_seams_for_uv(obj)
+        return seam_count
+
+
+# =========================================================================
+# UV层自动同步引擎 (当活动物体切换UV层时，自动同步所有选中物体及专属缝合边)
 # =========================================================================
 
 class UVAutoSync:
     _last_active_index = {}
     _last_render_index = {}
     _is_syncing = False
+
+    @classmethod
+    def record_active_index(cls, obj_name, idx):
+        cls._last_active_index[obj_name] = idx
+
+    @classmethod
+    def record_render_index(cls, obj_name, idx):
+        cls._last_render_index[obj_name] = idx
 
     @classmethod
     def update_handler(cls, scene, depsgraph):
@@ -25,13 +193,7 @@ class UVAutoSync:
         if not active_obj or active_obj.type != 'MESH':
             return
 
-        selected_objs = [o for o in context.selected_objects if o.type == 'MESH' and o != active_obj]
-        if not selected_objs:
-            if active_obj.data and active_obj.data.uv_layers:
-                cls._last_active_index[active_obj.name] = active_obj.data.uv_layers.active_index
-            return
-
-        uv_layers = active_obj.data.uv_layers
+        uv_layers = active_obj.data.uv_layers if active_obj.data else None
         if not uv_layers:
             return
 
@@ -46,24 +208,40 @@ class UVAutoSync:
                 break
         prev_render_idx = cls._last_render_index.get(active_obj.name)
 
+        cls._last_active_index[active_obj.name] = curr_active_idx
+        cls._last_render_index[active_obj.name] = curr_render_idx
+
+        # 检查是否发生索引变动
+        has_active_change = (prev_active_idx is not None and prev_active_idx != curr_active_idx)
+        has_render_change = (curr_render_idx is not None and prev_render_idx is not None and prev_render_idx != curr_render_idx)
+
+        if not has_active_change and not has_render_change:
+            return
+
+        selected_objs = [o for o in context.selected_objects if o.type == 'MESH' and o != active_obj]
+
         cls._is_syncing = True
         try:
-            # 1. 同步活动UV层索引
-            if prev_active_idx is not None and prev_active_idx != curr_active_idx:
+            # 1. 如果活动层在原生面板被切换，处理专属缝合边换存与多物体同步
+            if has_active_change:
+                old_layer_name = uv_layers[prev_active_idx].name if 0 <= prev_active_idx < len(uv_layers) else None
+                if old_layer_name:
+                    UVSeamsManager.save_seams_for_uv(active_obj, old_layer_name)
+                new_layer_name = uv_layers[curr_active_idx].name if 0 <= curr_active_idx < len(uv_layers) else None
+                if new_layer_name:
+                    UVSeamsManager.load_seams_for_uv(active_obj, new_layer_name)
+
                 for target_obj in selected_objs:
                     t_layers = target_obj.data.uv_layers
                     if t_layers and 0 <= curr_active_idx < len(t_layers):
-                        t_layers.active_index = curr_active_idx
+                        UVSeamsManager.switch_layer_with_seams(target_obj, curr_active_idx)
 
             # 2. 同步渲染UV层
-            if curr_render_idx is not None and prev_render_idx is not None and prev_render_idx != curr_render_idx:
+            if has_render_change:
                 for target_obj in selected_objs:
                     t_layers = target_obj.data.uv_layers
                     if t_layers and 0 <= curr_render_idx < len(t_layers):
                         t_layers[curr_render_idx].active_render = True
-
-            cls._last_active_index[active_obj.name] = curr_active_idx
-            cls._last_render_index[active_obj.name] = curr_render_idx
         finally:
             cls._is_syncing = False
 
@@ -84,10 +262,13 @@ class UV_OT_AddLayer(Operator):
 
     def execute(self, context):
         obj = context.object
-        layers = obj.data.uv_layers
-        new_layer = layers.new(name=f"UVMap.{len(layers)+1}")
-        layers.active_index = len(layers)-1
-        sync_uv_layers(obj)
+        if obj and obj.type == 'MESH':
+            UVSeamsManager.save_seams_for_uv(obj)
+            layers = obj.data.uv_layers
+            new_layer = layers.new(name=f"UVMap.{len(layers)+1}")
+            layers.active_index = len(layers)-1
+            UVSeamsManager.load_seams_for_uv(obj)
+            sync_uv_layers(obj)
         return {'FINISHED'}
 
 
@@ -103,8 +284,17 @@ class UV_OT_RemoveLayer(Operator):
     def execute(self, context):
         obj = context.object
         layers = obj.data.uv_layers
+        old_active_name = layers.active.name if layers.active else None
         layers.remove(layers.active)
         layers.active_index = min(layers.active_index, len(layers)-1)
+        if old_active_name:
+            try:
+                d = json.loads(obj.data.get("_uv_seams_dict", "{}"))
+                d.pop(old_active_name, None)
+                obj.data["_uv_seams_dict"] = json.dumps(d)
+            except Exception:
+                pass
+        UVSeamsManager.load_seams_for_uv(obj)
         sync_uv_layers(obj)
         return {'FINISHED'}
 
@@ -112,7 +302,7 @@ class UV_OT_RemoveLayer(Operator):
 class UV_OT_SetActiveLayerDirect(Operator):
     bl_idname = "uv.set_active_layer_direct"
     bl_label = "切换当前UV层"
-    bl_description = "点击直接将所有选中物体的当前UV层切换到此层"
+    bl_description = "点击直接将所有选中物体的当前UV层切换到此层并自动恢复专属缝合边"
     bl_options = {'REGISTER', 'UNDO'}
 
     layer_index: IntProperty()
@@ -127,8 +317,12 @@ class UV_OT_SetActiveLayerDirect(Operator):
         for obj in selected_objs:
             uv_layers = obj.data.uv_layers
             if 0 <= target_index < len(uv_layers):
-                uv_layers.active_index = target_index
+                UVSeamsManager.switch_layer_with_seams(obj, target_index)
                 count += 1
+
+        for area in context.screen.areas:
+            if area.type in {'IMAGE_EDITOR', 'VIEW_3D'}:
+                area.tag_redraw()
 
         return {'FINISHED'}
 
@@ -136,7 +330,7 @@ class UV_OT_SetActiveLayerDirect(Operator):
 class UV_OT_SyncLayerSelection(Operator):
     bl_idname = "uv.sync_layer_selection_pro"
     bl_label = "同步选择UV层"
-    bl_description = "将所有选中物体的当前UV层切换到此层"
+    bl_description = "将所有选中物体的当前UV层切换到此层并恢复专属缝合边"
     bl_options = {'REGISTER', 'UNDO'}
 
     layer_index: IntProperty()
@@ -150,7 +344,79 @@ class UV_OT_SyncLayerSelection(Operator):
         for obj in selected_objs:
             uv_layers = obj.data.uv_layers
             if 0 <= target_index < len(uv_layers):
-                uv_layers.active_index = target_index
+                UVSeamsManager.switch_layer_with_seams(obj, target_index)
+
+        for area in context.screen.areas:
+            if area.type in {'IMAGE_EDITOR', 'VIEW_3D'}:
+                area.tag_redraw()
+
+        return {'FINISHED'}
+
+
+class UV_OT_SaveCurrentSeams(Operator):
+    """手动将当前视图网格中的缝合边保存并绑定到当前活动 UV 层"""
+    bl_idname = "uv.save_current_seams_pro"
+    bl_label = "保存当前UV缝合边"
+    bl_description = "将当前模型标记的缝合边显式保存到当前活动UV层"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        selected_objs = [obj for obj in context.selected_objects if obj.type == 'MESH']
+        if not selected_objs and context.object and context.object.type == 'MESH':
+            selected_objs = [context.object]
+
+        for obj in selected_objs:
+            UVSeamsManager.save_seams_for_uv(obj)
+
+        self.report({'INFO'}, f"已保存 {len(selected_objs)} 个物体的当前UV专属缝合边")
+        return {'FINISHED'}
+
+
+class UV_OT_SeamsFromIslands(Operator):
+    """将当前活动 UV 层的 UV 岛边界自动转化为缝合边并保存"""
+    bl_idname = "uv.seams_from_islands_pro"
+    bl_label = "当前UV转缝合边"
+    bl_description = "根据当前活动UV层的UV岛边界自动标记缝合边并绑定到当前层"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        selected_objs = [obj for obj in context.selected_objects if obj.type == 'MESH']
+        if not selected_objs and context.object and context.object.type == 'MESH':
+            selected_objs = [context.object]
+
+        total_seams = 0
+        for obj in selected_objs:
+            total_seams += UVSeamsManager.generate_seams_from_uv(obj)
+
+        for area in context.screen.areas:
+            if area.type in {'IMAGE_EDITOR', 'VIEW_3D'}:
+                area.tag_redraw()
+
+        self.report({'INFO'}, f"成功根据当前UV生成并保存了 {total_seams} 条缝合边")
+        return {'FINISHED'}
+
+
+class UV_OT_ClearCurrentSeams(Operator):
+    """清除当前活动 UV 层绑定的缝合边标记"""
+    bl_idname = "uv.clear_current_seams_pro"
+    bl_label = "清除当前缝合边"
+    bl_description = "清除当前活动UV层绑定的全部缝合边"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        selected_objs = [obj for obj in context.selected_objects if obj.type == 'MESH']
+        if not selected_objs and context.object and context.object.type == 'MESH':
+            selected_objs = [context.object]
+
+        for obj in selected_objs:
+            UVSeamsManager.set_current_seams(obj, [])
+            UVSeamsManager.save_seams_for_uv(obj)
+
+        for area in context.screen.areas:
+            if area.type in {'IMAGE_EDITOR', 'VIEW_3D'}:
+                area.tag_redraw()
+
+        self.report({'INFO'}, f"已清除 {len(selected_objs)} 个物体当前层的缝合边")
         return {'FINISHED'}
 
 
@@ -500,6 +766,9 @@ classes = (
     UV_UL_LayersList,
     UV_OT_CopyActiveLayer,
     UV_OT_PasteToActiveLayer,
+    UV_OT_SaveCurrentSeams,
+    UV_OT_SeamsFromIslands,
+    UV_OT_ClearCurrentSeams,
 )
 
 def register():
