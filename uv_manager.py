@@ -548,9 +548,9 @@ class UV_OT_CopyActiveLayer(Operator):
                 continue
 
             mesh = obj.data
-            is_edit_active = (original_mode == 'EDIT_MESH' and obj == active_obj)
+            is_in_edit = (obj.mode == 'EDIT')
             
-            if is_edit_active:
+            if is_in_edit:
                 bm = bmesh.from_edit_mesh(mesh)
             else:
                 bm = bmesh.new()
@@ -559,13 +559,13 @@ class UV_OT_CopyActiveLayer(Operator):
             bm.faces.ensure_lookup_table()
             uv_layer_bm = bm.loops.layers.uv.active
             if not uv_layer_bm:
-                if not is_edit_active:
+                if not is_in_edit:
                     bm.free()
                 continue
 
             # 检测是否有局部选中的面或选中的UV顶点/块
             selected_faces = []
-            if original_mode == 'EDIT_MESH':
+            if is_in_edit:
                 selected_faces = [f for f in bm.faces if f.select or any(l.uv_select_vert for l in f.loops)]
 
             is_partial = len(selected_faces) > 0 and len(selected_faces) < len(bm.faces)
@@ -586,7 +586,7 @@ class UV_OT_CopyActiveLayer(Operator):
             uv_data = [tuple(loop[uv_layer_bm].uv) for loop in all_loops]
             pin_uv = [loop[uv_layer_bm].pin_uv for loop in all_loops]
 
-            if not is_edit_active:
+            if not is_in_edit:
                 bm.free()
 
             obj_data_dict = {
@@ -691,8 +691,8 @@ class UV_OT_PasteToActiveLayer(Operator):
                     self.report({'WARNING'}, f"拓扑不匹配或未找到对应数据：{obj.name}")
                     continue
 
-                is_edit_active = (original_mode == 'EDIT_MESH' and obj == active_obj)
-                if is_edit_active:
+                is_in_edit = (obj.mode == 'EDIT')
+                if is_in_edit:
                     bm = bmesh.from_edit_mesh(mesh)
                 else:
                     bm = bmesh.new()
@@ -726,7 +726,7 @@ class UV_OT_PasteToActiveLayer(Operator):
                             loop[uv_layer].uv = Vector(uv_val)
                             loop[uv_layer].pin_uv = pin_val
 
-                if is_edit_active:
+                if is_in_edit:
                     bmesh.update_edit_mesh(mesh)
                 else:
                     bm.to_mesh(mesh)
