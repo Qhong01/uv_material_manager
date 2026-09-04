@@ -310,7 +310,7 @@ class VIEW3D_PT_UVLayerManager(Panel):
                 rows=2
             )
             
-            # 新增底部操作栏
+            # 底部复制粘贴操作栏
             button_row = list_box.row(align=True)
             button_row.scale_x = 1.2  # 横向扩展按钮宽度
 
@@ -329,6 +329,12 @@ class VIEW3D_PT_UVLayerManager(Panel):
                 icon='PASTEDOWN',
                 text="粘贴到当前层"
             )
+
+            # UV层专属缝合边工具栏
+            seam_row = list_box.row(align=True)
+            seam_row.operator("uv.seams_from_islands_pro", icon='UV_ISLANDSEL', text="当前UV转缝合边")
+            seam_row.operator("uv.save_current_seams_pro", icon='FILE_TICK', text="保存缝合边")
+            seam_row.operator("uv.clear_current_seams_pro", icon='TRASH', text="清除缝合边")
         else:
             list_box.label(text="请选择网格物体", icon='ERROR')
 
