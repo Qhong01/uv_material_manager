@@ -17,6 +17,7 @@ from . import material_manager
 from . import modifier_manager
 from . import ui
 from . import uv_checker
+from . import shading_manager
 from .material_manager import MaterialTemplateManager
 
 # 插件首选项面板
@@ -53,9 +54,11 @@ def register():
     modifier_manager.register()
     ui.register()
     uv_checker.register()
+    shading_manager.register()
 
 # 注销所有模块
 def unregister():
+    shading_manager.unregister()
     uv_checker.unregister()
     ui.unregister()
     modifier_manager.unregister()
