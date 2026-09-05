@@ -11,6 +11,7 @@ from bpy.props import (
     BoolProperty,
     IntProperty,
 )
+from bpy.app.handlers import persistent
 
 CONFIG_FILENAME = "layout_config.json"
 
@@ -74,6 +75,8 @@ def save_json_config(items_data):
         print(f"[UV_Material_Manager] 保存布局配置失败: {e}")
 
 def save_scene_layouts_to_json(scene):
+    if not scene or not hasattr(scene, 'um_custom_layouts'):
+        return
     items_data = []
     for item in scene.um_custom_layouts:
         items_data.append({
@@ -86,12 +89,14 @@ def save_scene_layouts_to_json(scene):
     save_json_config(items_data)
 
 def on_property_updated(self, context):
-    save_scene_layouts_to_json(context.scene)
+    if context and hasattr(context, 'scene') and context.scene:
+        save_scene_layouts_to_json(context.scene)
 
 def on_editor_type_updated(self, context):
     if not self.name or self.name == "新视图" or any(self.name == v for v in EDITOR_DEFAULT_NAMES.values()):
         self.name = EDITOR_DEFAULT_NAMES.get(self.editor_type, "新视图")
-    save_scene_layouts_to_json(context.scene)
+    if context and hasattr(context, 'scene') and context.scene:
+        save_scene_layouts_to_json(context.scene)
 
 
 class CustomLayoutItem(PropertyGroup):
@@ -102,18 +107,27 @@ class CustomLayoutItem(PropertyGroup):
     ratio: FloatProperty(name="占比", default=0.5, min=0.15, max=0.85, step=5, precision=2, subtype='FACTOR', update=on_property_updated)
 
 
-def ensure_custom_layouts_loaded(scene):
-    if not getattr(scene, 'um_layouts_loaded', False):
-        scene.um_custom_layouts.clear()
-        data = load_json_config()
-        for d in data:
-            item = scene.um_custom_layouts.add()
-            item.id = d.get('id', str(int(time.time() * 1000)))
-            item.name = d.get('name', '新视图')
-            item.editor_type = d.get('editor_type', 'UV')
-            item.direction = d.get('direction', 'LEFT')
-            item.ratio = d.get('ratio', 0.5)
-        scene.um_layouts_loaded = True
+def sync_layouts_to_scene(scene):
+    if not scene or not hasattr(scene, 'um_custom_layouts'):
+        return
+    scene.um_custom_layouts.clear()
+    data = load_json_config()
+    for d in data:
+        item = scene.um_custom_layouts.add()
+        item.id = d.get('id', str(int(time.time() * 1000)))
+        item.name = d.get('name', '新视图')
+        item.editor_type = d.get('editor_type', 'UV')
+        item.direction = d.get('direction', 'LEFT')
+        item.ratio = d.get('ratio', 0.5)
+
+
+@persistent
+def on_load_post_sync(dummy):
+    try:
+        if bpy.context.scene:
+            sync_layouts_to_scene(bpy.context.scene)
+    except Exception as e:
+        print(f"[UV_Material_Manager] 场景加载同步失败: {e}")
 
 
 def get_editor_icon(editor_type):
@@ -126,8 +140,6 @@ def get_editor_icon(editor_type):
 def close_secondary_area(context):
     wm = context.window_manager
     secondary_ptr = getattr(wm, "um_secondary_area_ptr", "")
-    active_layout_id = getattr(wm, "um_active_layout_id", "")
-    
     wm.um_secondary_area_ptr = ""
     wm.um_active_layout_id = ""
 
@@ -205,7 +217,6 @@ class WORKSPACE_OT_ToggleCustomLayout(Operator):
     item_id: StringProperty(default="")
 
     def execute(self, context):
-        ensure_custom_layouts_loaded(context.scene)
         scene = context.scene
         wm = context.window_manager
 
@@ -247,7 +258,6 @@ class WORKSPACE_OT_ToggleCustomLayout(Operator):
         direction = target_item.direction
         ratio = max(0.15, min(0.85, target_item.ratio))
 
-        # 根据方位与比例计算分割方向与 factor
         if direction in {'LEFT', 'RIGHT'}:
             split_dir = 'VERTICAL'
             factor = ratio if direction == 'LEFT' else (1.0 - ratio)
@@ -264,7 +274,6 @@ class WORKSPACE_OT_ToggleCustomLayout(Operator):
 
             new_area = context.screen.areas[-1]
 
-            # 确定哪一个是副屏目标区域，哪一个是保留的 3D 视图
             if split_dir == 'VERTICAL':
                 left_a = orig_3d_area if orig_3d_area.x < new_area.x else new_area
                 right_a = new_area if orig_3d_area.x < new_area.x else orig_3d_area
@@ -300,9 +309,7 @@ class WORKSPACE_OT_AddCustomLayoutItem(Operator):
     bl_options = {'REGISTER'}
 
     def execute(self, context):
-        ensure_custom_layouts_loaded(context.scene)
         scene = context.scene
-
         new_item = scene.um_custom_layouts.add()
         new_item.id = str(int(time.time() * 1000))
         new_item.editor_type = 'UV'
@@ -325,7 +332,6 @@ class WORKSPACE_OT_RemoveCustomLayoutItem(Operator):
     index: IntProperty(default=0)
 
     def execute(self, context):
-        ensure_custom_layouts_loaded(context.scene)
         scene = context.scene
         wm = context.window_manager
 
@@ -354,20 +360,26 @@ def register():
 
     bpy.types.Scene.um_custom_layouts = CollectionProperty(type=CustomLayoutItem)
     bpy.types.Scene.um_show_layout_settings = BoolProperty(name="显示视图配置", default=False)
-    bpy.types.Scene.um_layouts_loaded = BoolProperty(name="已加载配置", default=False)
 
     bpy.types.WindowManager.um_active_layout_id = StringProperty(name="活动视图ID", default="")
     bpy.types.WindowManager.um_secondary_area_ptr = StringProperty(name="副屏区域指针", default="")
 
+    if on_load_post_sync not in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.append(on_load_post_sync)
+
+    if bpy.context.scene:
+        sync_layouts_to_scene(bpy.context.scene)
+
 
 def unregister():
+    if on_load_post_sync in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(on_load_post_sync)
+
     if hasattr(bpy.types.WindowManager, 'um_secondary_area_ptr'):
         del bpy.types.WindowManager.um_secondary_area_ptr
     if hasattr(bpy.types.WindowManager, 'um_active_layout_id'):
         del bpy.types.WindowManager.um_active_layout_id
 
-    if hasattr(bpy.types.Scene, 'um_layouts_loaded'):
-        del bpy.types.Scene.um_layouts_loaded
     if hasattr(bpy.types.Scene, 'um_show_layout_settings'):
         del bpy.types.Scene.um_show_layout_settings
     if hasattr(bpy.types.Scene, 'um_custom_layouts'):
