@@ -154,8 +154,16 @@ def set_object_color(self, value):
 
 class ShadingUIProps(PropertyGroup):
     show_viewport_shading: BoolProperty(name="视图着色方式", default=True)
-    show_shading_options: BoolProperty(name="选项", default=False)
     show_object_shading: BoolProperty(name="物体着色", default=True)
+
+    matcap_icon_scale: FloatProperty(
+        name="图标缩放",
+        description="调节点击快照材质/棚灯时弹出的球体图标缩放比例",
+        default=2.8,
+        min=1.5,
+        max=4.5,
+        precision=1
+    )
 
     object_display_type: EnumProperty(name="显示为", items=DISPLAY_TYPE_ITEMS, get=get_disp_type, set=set_disp_type)
     object_show_wire: BoolProperty(name="线框", get=get_show_wire, set=set_show_wire)
@@ -316,10 +324,14 @@ class VIEW3D_PT_QuickShadingPopover(Panel):
 
             if shading.light in {'STUDIO', 'MATCAP'}:
                 sub = box_view.row(align=True)
-                sub.scale_y = 0.55
-                sub.template_icon_view(shading, "studio_light", scale_popup=2.0)
+                sub.scale_y = 0.65
+                sub.template_icon_view(shading, "studio_light", scale_popup=props.matcap_icon_scale)
                 if shading.light == 'MATCAP':
-                    sub.operator("view3d.toggle_matcap_flip", text="", icon='ARROW_LEFTRIGHT')
+                    sub.operator("view3d.toggle_matcap_flip", text="", icon='MOD_MIRROR')
+                
+                # 自由调节图标大小滑块
+                scale_row = box_view.row(align=True)
+                scale_row.prop(props, "matcap_icon_scale", text="图标缩放", slider=True)
 
             # 线框颜色：横排三按钮平铺
             if hasattr(shading, 'wireframe_color_type'):
@@ -354,18 +366,13 @@ class VIEW3D_PT_QuickShadingPopover(Panel):
             if shading.background_type == 'VIEWPORT':
                 box_view.prop(shading, "background_color", text="")
 
-            # 选项 (可折叠)
-            box_opt = box_view.box()
-            h_opt = box_opt.row(align=True)
-            icon_opt = 'DOWNARROW_HLT' if props.show_shading_options else 'RIGHTARROW'
-            h_opt.prop(props, "show_shading_options", text="选项", icon=icon_opt, emboss=False)
-
-            if props.show_shading_options:
-                g_opt = box_opt.grid_flow(columns=2, align=True)
-                g_opt.prop(shading, "show_backface_culling", text="背面剔除", toggle=True)
-                g_opt.prop(shading, "show_shadows", text="阴影", toggle=True)
-                g_opt.prop(shading, "show_cavity", text="空腔/曲率", toggle=True)
-                g_opt.prop(shading, "show_object_outline", text="轮廓线", toggle=True)
+            # 选项：一整排平铺四个选项，无需下拉折叠框
+            box_view.label(text="选项")
+            row_opts = box_view.row(align=True)
+            row_opts.prop(shading, "show_backface_culling", text="背面剔除", toggle=True)
+            row_opts.prop(shading, "show_shadows", text="阴影", toggle=True)
+            row_opts.prop(shading, "show_cavity", text="空腔/曲率", toggle=True)
+            row_opts.prop(shading, "show_object_outline", text="轮廓线", toggle=True)
 
         # =========================================================================
         # 2. 物体着色 (可折叠)
