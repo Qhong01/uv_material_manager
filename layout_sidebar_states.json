@@ -1,0 +1,93 @@
+{
+  "UV": {
+    "show_region_ui": true,
+    "show_region_toolbar": false,
+    "active_panel_category": "UV Tools"
+  },
+  "SHADER": {
+    "show_region_ui": false,
+    "show_region_toolbar": false,
+    "active_panel_category": "Tool"
+  },
+  "GEOMETRY": {
+    "show_region_ui": true,
+    "show_region_toolbar": false,
+    "active_panel_category": "Item"
+  },
+  "COMPOSITOR": {
+    "show_region_ui": true,
+    "show_region_toolbar": false,
+    "active_panel_category": "Item"
+  },
+  "ASSETS": {
+    "show_region_ui": true,
+    "show_region_toolbar": true,
+    "browse_mode": "ASSETS",
+    "asset_library_reference": "ALL",
+    "catalog_id": "0603d3f2-7688-4747-983b-b50cb6572439",
+    "active_panel_category": "",
+    "import_method": "FOLLOW_PREFS",
+    "display_type": "THUMBNAIL",
+    "filter_search": "",
+    "directory": ""
+  },
+  "FILES": {
+    "show_region_ui": false,
+    "show_region_toolbar": true,
+    "browse_mode": "FILES",
+    "active_panel_category": ""
+  },
+  "TIMELINE": {
+    "show_region_ui": true,
+    "show_region_toolbar": false,
+    "show_region_channels": true,
+    "active_panel_category": "View"
+  },
+  "GRAPH": {
+    "show_region_ui": true,
+    "show_region_toolbar": false,
+    "show_region_channels": true,
+    "active_panel_category": "View"
+  },
+  "OUTLINER": {
+    "show_region_ui": false,
+    "show_region_toolbar": false,
+    "display_mode": "VIEW_LAYER"
+  },
+  "PROPERTIES": {
+    "show_region_ui": false,
+    "show_region_toolbar": false,
+    "properties_context": "MODIFIER"
+  },
+  "TEXT": {
+    "show_region_ui": true,
+    "show_region_toolbar": false,
+    "active_panel_category": "Text"
+  },
+  "uv1": {
+    "show_region_ui": true,
+    "show_region_toolbar": false,
+    "active_panel_category": "UV Tools"
+  },
+  "sh2": {
+    "show_region_ui": false,
+    "show_region_toolbar": false,
+    "active_panel_category": "Tool"
+  },
+  "1788594608644": {
+    "show_region_ui": true,
+    "show_region_toolbar": true,
+    "browse_mode": "ASSETS",
+    "asset_library_reference": "ALL",
+    "catalog_id": "0603d3f2-7688-4747-983b-b50cb6572439",
+    "import_method": "FOLLOW_PREFS",
+    "display_type": "THUMBNAIL",
+    "filter_search": "",
+    "directory": ""
+  },
+  "IMAGE_EDITOR": {
+    "show_region_ui": true,
+    "show_region_toolbar": false,
+    "active_panel_category": "Tool"
+  }
+}

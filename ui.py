@@ -119,7 +119,7 @@ class VIEW3D_PT_UltimateManager(Panel):
         layout = self.layout
         props = context.scene.um_props
         
-        # 0. 常用建模与大纲视图工具栏 (拍平面、合并材质、填充孔洞、大纲视图)
+        # 0. 常用建模、大纲与着色工具栏 (第一排：拍平面、合并材质、填充孔洞、大纲视图、清理法线、着色菜单)
         tools_row = layout.row(align=True)
         tools_row.operator("mesh.flatten_face_by_three_vertices", text="拍平面", icon='SNAP_FACE')
         tools_row.operator("object.ultra_material_combine", text="合并材质", icon='NODETREE')
@@ -131,7 +131,10 @@ class VIEW3D_PT_UltimateManager(Panel):
         else:
             tools_row.operator("view3d.toggle_outliner", text="大纲视图", icon='OUTLINER')
 
-        # 1. 动态自定义分屏与着色工具栏
+        tools_row.operator("custom.clear_normals", icon='NORMALS_FACE', text="清理法线")
+        tools_row.popover(panel="VIEW3D_PT_QuickShadingPopover", text="着色", icon='SHADING_SOLID')
+
+        # 1. 动态自定义分屏工具栏 (第二排：只放分屏功能按键，右侧保留配置齿轮)
         from .workspace import get_editor_icon
 
         top_row = layout.row(align=True)
@@ -139,38 +142,44 @@ class VIEW3D_PT_UltimateManager(Panel):
         custom_layouts = getattr(context.scene, "um_custom_layouts", [])
 
         if len(custom_layouts) == 0:
-            top_row.operator("workspace.add_custom_layout", text="添加分屏视图", icon='ADD')
+            top_row.menu("WORKSPACE_MT_add_custom_layout_menu", text="添加分屏视图", icon='ADD')
         else:
-            for item in custom_layouts:
+            for idx, item in enumerate(custom_layouts):
                 is_active = (active_id == item.id)
                 icon_name = get_editor_icon(item.editor_type)
-                btn = top_row.operator("workspace.toggle_custom_layout", text=item.name, icon=icon_name, depress=is_active)
-                btn.item_id = item.id
+                slot_num = idx + 1
+                if slot_num <= 10:
+                    op_id = f"view3d.toggle_custom_layout_{slot_num}"
+                else:
+                    op_id = "view3d.toggle_custom_layout"
 
-        top_row.operator("custom.clear_normals", icon='NORMALS_FACE', text="清除法线")
-        top_row.popover(panel="VIEW3D_PT_QuickShadingPopover", text="着色菜单", icon='SHADING_SOLID')
+                btn = top_row.operator(op_id, text=item.name, icon=icon_name, depress=is_active)
+                if op_id == "view3d.toggle_custom_layout":
+                    btn.item_id = item.id
+                    btn.item_name = item.name
+                    btn.editor_type = item.editor_type
+                    btn.index = idx
+
         top_row.prop(context.scene, "um_show_layout_settings", text="", icon='PREFERENCES' if not context.scene.um_show_layout_settings else 'DOWNARROW_HLT')
 
-        # 2. 分屏视图管理配置展开面板
+        # 2. 分屏视图管理配置展开面板 (单行紧凑模式：名称 + 方位 + 占比 + 删除)
         if getattr(context.scene, "um_show_layout_settings", False):
             cfg_box = layout.box()
             cfg_hdr = cfg_box.row(align=True)
             cfg_hdr.label(text="自定义分屏视图管理器", icon='PREFERENCES')
-            cfg_hdr.operator("workspace.add_custom_layout", text="添加新项", icon='ADD')
+            cfg_hdr.menu("WORKSPACE_MT_add_custom_layout_menu", text="添加新项", icon='ADD')
 
             if len(custom_layouts) == 0:
                 cfg_box.label(text="暂未添加任何分屏视图，点击右上角「添加新项」开始配置", icon='INFO')
             else:
                 for idx, item in enumerate(custom_layouts):
-                    ibox = cfg_box.box()
-                    r1 = ibox.row(align=True)
-                    r1.prop(item, "name", text="名称")
-                    r1.prop(item, "editor_type", text="")
-
-                    r2 = ibox.row(align=True)
-                    r2.prop(item, "direction", expand=True)
-                    r2.prop(item, "ratio", text="占比", slider=True)
-                    del_op = r2.operator("workspace.remove_custom_layout", text="", icon='TRASH')
+                    r = cfg_box.row(align=True)
+                    r.prop(item, "name", text="")
+                    r.prop(item, "direction", text="")
+                    r.prop(item, "ratio", text="", slider=True)
+                    del_sub = r.row(align=True)
+                    del_sub.scale_x = 0.7
+                    del_op = del_sub.operator("workspace.remove_custom_layout", text="", icon='TRASH')
                     del_op.index = idx
 
         # 自动平滑功能区

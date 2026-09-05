@@ -404,7 +404,7 @@ class OUTLINER_OT_ToggleOperator(Operator):
 
             for area in areas_to_close:
                 try:
-                    with context.temp_override(window=win, area=area):
+                    with context.temp_override(window=win, screen=win.screen, area=area):
                         bpy.ops.screen.area_close()
                 except Exception as e:
                     self.report({'WARNING'}, f"关闭区域失败: {str(e)}")
@@ -415,14 +415,21 @@ class OUTLINER_OT_ToggleOperator(Operator):
             self.report({'INFO'}, "大纲视图已关闭")
             return {'FINISHED'}
 
-        bpy.ops.screen.area_split(direction='VERTICAL', factor=0.85)
-        new_area = context.screen.areas[-1]
+        view3d_area = next((a for a in win.screen.areas if a.type == 'VIEW_3D'), None)
+        if not view3d_area:
+            self.report({'ERROR'}, "未找到 3D 视图")
+            return {'CANCELLED'}
+
+        with context.temp_override(window=win, screen=win.screen, area=view3d_area):
+            bpy.ops.screen.area_split(direction='VERTICAL', factor=0.85)
+
+        new_area = win.screen.areas[-1]
         new_area.type = 'PROPERTIES'
 
-        with context.temp_override(area=new_area):
+        with context.temp_override(window=win, screen=win.screen, area=new_area):
             bpy.ops.screen.area_split(direction='HORIZONTAL', factor=0.7)
-            properties_area = context.area
-            outliner_area = context.screen.areas[-1]
+            properties_area = context.area if context.area else new_area
+            outliner_area = win.screen.areas[-1]
             outliner_area.type = 'OUTLINER'
 
             for space in outliner_area.spaces:
@@ -447,13 +454,29 @@ classes = (
     OUTLINER_OT_ToggleOperator,
 )
 
+def safe_register_class(cls):
+    try:
+        bpy.utils.register_class(cls)
+    except ValueError:
+        try:
+            bpy.utils.unregister_class(cls)
+            bpy.utils.register_class(cls)
+        except Exception:
+            pass
+
+def safe_unregister_class(cls):
+    try:
+        bpy.utils.unregister_class(cls)
+    except Exception:
+        pass
+
 def register():
     for cls in classes:
-        bpy.utils.register_class(cls)
+        safe_register_class(cls)
     bpy.types.Scene.outliner_state = PointerProperty(type=OutlinerState)
 
 def unregister():
     if hasattr(bpy.types.Scene, 'outliner_state'):
         del bpy.types.Scene.outliner_state
     for cls in reversed(classes):
-        bpy.utils.unregister_class(cls)
+        safe_unregister_class(cls)

@@ -316,7 +316,6 @@ class VIEW3D_PT_QuickShadingPopover(Panel):
 
         if props.show_viewport_shading and shading:
             # 光照：横排三按钮平铺
-            box_view.label(text="光照")
             row_light = box_view.row(align=True)
             row_light.prop_enum(shading, "light", 'STUDIO', text="棚灯")
             row_light.prop_enum(shading, "light", 'MATCAP', text="快照材质")
@@ -326,23 +325,15 @@ class VIEW3D_PT_QuickShadingPopover(Panel):
                 sub = box_view.row(align=True)
                 sub.scale_y = 0.65
                 sub.template_icon_view(shading, "studio_light", scale_popup=props.matcap_icon_scale)
-                if shading.light == 'MATCAP':
-                    sub.operator("view3d.toggle_matcap_flip", text="", icon='MOD_MIRROR')
-                
-                # 自由调节图标大小滑块
-                scale_row = box_view.row(align=True)
-                scale_row.prop(props, "matcap_icon_scale", text="图标缩放", slider=True)
 
             # 线框颜色：横排三按钮平铺
             if hasattr(shading, 'wireframe_color_type'):
-                box_view.label(text="线框颜色")
                 row_wire = box_view.row(align=True)
                 row_wire.prop_enum(shading, "wireframe_color_type", 'THEME', text="主题")
                 row_wire.prop_enum(shading, "wireframe_color_type", 'OBJECT', text="物体")
                 row_wire.prop_enum(shading, "wireframe_color_type", 'RANDOM', text="随机")
 
             # 颜色：两行三列紧凑网格
-            box_view.label(text="颜色")
             row_c1 = box_view.row(align=True)
             row_c1.prop_enum(shading, "color_type", 'MATERIAL', text="材质")
             row_c1.prop_enum(shading, "color_type", 'RANDOM', text="随机")
@@ -357,7 +348,6 @@ class VIEW3D_PT_QuickShadingPopover(Panel):
                 box_view.prop(shading, "single_color", text="")
 
             # 背景：横排三按钮平铺
-            box_view.label(text="背景")
             row_bg = box_view.row(align=True)
             row_bg.prop_enum(shading, "background_type", 'THEME', text="主题")
             row_bg.prop_enum(shading, "background_type", 'WORLD', text="世界")
@@ -367,7 +357,6 @@ class VIEW3D_PT_QuickShadingPopover(Panel):
                 box_view.prop(shading, "background_color", text="")
 
             # 选项：一整排平铺四个选项，无需下拉折叠框
-            box_view.label(text="选项")
             row_opts = box_view.row(align=True)
             row_opts.prop(shading, "show_backface_culling", text="背面剔除", toggle=True)
             row_opts.prop(shading, "show_shadows", text="阴影", toggle=True)
@@ -391,12 +380,10 @@ class VIEW3D_PT_QuickShadingPopover(Panel):
             row_four.prop(props, "object_is_shadow_catcher", text="阴影捕捉", toggle=True)
 
             # 显示为 (横排四按钮平铺，同时设置全部选中物体)
-            box_obj.label(text="显示为")
             row_disp = box_obj.row(align=True)
             row_disp.prop(props, "object_display_type", expand=True)
 
             # 视口颜色 (12 色纯色方块调色板)
-            box_obj.label(text="视口颜色")
             pcoll = preview_collections.get("main")
             pal_row = box_obj.row(align=True)
             pal_row.scale_y = 0.95
@@ -426,10 +413,26 @@ classes = (
     VIEW3D_PT_QuickShadingPopover,
 )
 
+def safe_register_class(cls):
+    try:
+        bpy.utils.register_class(cls)
+    except ValueError:
+        try:
+            bpy.utils.unregister_class(cls)
+            bpy.utils.register_class(cls)
+        except Exception:
+            pass
+
+def safe_unregister_class(cls):
+    try:
+        bpy.utils.unregister_class(cls)
+    except Exception:
+        pass
+
 def register():
     ensure_color_icons()
     for cls in classes:
-        bpy.utils.register_class(cls)
+        safe_register_class(cls)
     bpy.types.Scene.um_shading_props = PointerProperty(type=ShadingUIProps)
 
     pcoll = bpy.utils.previews.new()
@@ -452,4 +455,4 @@ def unregister():
         del bpy.types.Scene.um_shading_props
 
     for cls in reversed(classes):
-        bpy.utils.unregister_class(cls)
+        safe_unregister_class(cls)

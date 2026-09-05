@@ -16,7 +16,6 @@ from . import uv_manager
 from . import material_manager
 from . import modifier_manager
 from . import ui
-from . import uv_checker
 from . import shading_manager
 from . import modeling_tools
 from .material_manager import MaterialTemplateManager
@@ -45,16 +44,31 @@ class UVMM_AddonPreferences(AddonPreferences):
         row.operator("material.import_template_library", text="导入材质库 (.blend)", icon='IMPORT')
         row.operator("material.open_template_library_folder", text="打开存放文件夹", icon='FILE_FOLDER')
 
+def safe_register_class(cls):
+    try:
+        bpy.utils.register_class(cls)
+    except ValueError:
+        try:
+            bpy.utils.unregister_class(cls)
+            bpy.utils.register_class(cls)
+        except Exception:
+            pass
+
+def safe_unregister_class(cls):
+    try:
+        bpy.utils.unregister_class(cls)
+    except Exception:
+        pass
+
 # 注册所有模块
 def register():
-    bpy.utils.register_class(UVMM_AddonPreferences)
+    safe_register_class(UVMM_AddonPreferences)
     workspace.register()
     utils.register()
     uv_manager.register()
     material_manager.register()
     modifier_manager.register()
     ui.register()
-    uv_checker.register()
     shading_manager.register()
     modeling_tools.register()
 
@@ -62,14 +76,13 @@ def register():
 def unregister():
     modeling_tools.unregister()
     shading_manager.unregister()
-    uv_checker.unregister()
     ui.unregister()
     modifier_manager.unregister()
     material_manager.unregister()
     uv_manager.unregister()
     utils.unregister()
     workspace.unregister()
-    bpy.utils.unregister_class(UVMM_AddonPreferences)
+    safe_unregister_class(UVMM_AddonPreferences)
 
 if __name__ == "__main__":
     register()

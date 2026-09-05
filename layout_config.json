@@ -1,0 +1,23 @@
+[
+  {
+    "id": "uv1",
+    "name": "UV",
+    "editor_type": "UV",
+    "direction": "LEFT",
+    "ratio": 0.4000000059604645
+  },
+  {
+    "id": "sh2",
+    "name": "Shader",
+    "editor_type": "SHADER",
+    "direction": "LEFT",
+    "ratio": 0.4000000059604645
+  },
+  {
+    "id": "1788594608644",
+    "name": "资产库",
+    "editor_type": "ASSETS",
+    "direction": "LEFT",
+    "ratio": 0.4000000059604645
+  }
+]
