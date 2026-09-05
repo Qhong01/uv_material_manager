@@ -5,7 +5,7 @@ import colorsys
 import bpy
 import bpy.utils.previews
 from bpy.types import Operator, Panel, PropertyGroup
-from bpy.props import IntProperty, BoolProperty, PointerProperty
+from bpy.props import IntProperty, BoolProperty, FloatProperty, FloatVectorProperty, EnumProperty, PointerProperty
 
 PRESET_COLORS = [
     (1.0, 0.0, 0.0),     # 纯红
@@ -53,11 +53,118 @@ def ensure_color_icons():
             make_solid_png(fp, r, g, b)
 
 
+DISPLAY_TYPE_ITEMS = [
+    ('BOUNDS', '边界范围', '仅显示边界范围'),
+    ('WIRE', '线框', '显示为线框'),
+    ('SOLID', '实体', '显示为实体'),
+    ('TEXTURED', '纹理', '显示为纹理')
+]
+
+def _get_target_objs(context):
+    objs = [o for o in context.selected_objects if o.type in {'MESH', 'CURVE', 'SURFACE', 'FONT', 'META'}]
+    if not objs and context.object and context.object.type in {'MESH', 'CURVE', 'SURFACE', 'FONT', 'META'}:
+        objs = [context.object]
+    return objs
+
+def get_disp_type(self):
+    obj = bpy.context.active_object
+    if obj:
+        for idx, item in enumerate(DISPLAY_TYPE_ITEMS):
+            if item[0] == obj.display_type:
+                return idx
+    return 3
+
+def set_disp_type(self, value):
+    key = DISPLAY_TYPE_ITEMS[value][0]
+    for o in _get_target_objs(bpy.context):
+        o.display_type = key
+
+def get_show_wire(self):
+    obj = bpy.context.active_object
+    return obj.show_wire if obj else False
+
+def set_show_wire(self, value):
+    for o in _get_target_objs(bpy.context):
+        o.show_wire = value
+
+def get_show_retopology(self):
+    obj = bpy.context.active_object
+    return getattr(obj, 'show_all_edges', False) if obj else False
+
+def set_show_retopology(self, value):
+    for o in _get_target_objs(bpy.context):
+        if hasattr(o, 'show_all_edges'):
+            o.show_all_edges = value
+    view = bpy.context.space_data
+    if hasattr(view, 'overlay') and hasattr(view.overlay, 'show_retopology'):
+        view.overlay.show_retopology = value
+
+def get_show_in_front(self):
+    obj = bpy.context.active_object
+    return obj.show_in_front if obj else False
+
+def set_show_in_front(self, value):
+    for o in _get_target_objs(bpy.context):
+        o.show_in_front = value
+
+def get_shadow_catcher(self):
+    obj = bpy.context.active_object
+    return getattr(obj, 'is_shadow_catcher', False) if obj else False
+
+def set_shadow_catcher(self, value):
+    for o in _get_target_objs(bpy.context):
+        if hasattr(o, 'is_shadow_catcher'):
+            o.is_shadow_catcher = value
+
+def get_object_alpha(self):
+    obj = bpy.context.active_object
+    if obj and hasattr(obj, 'color') and len(obj.color) > 3:
+        return obj.color[3]
+    return 1.0
+
+def set_object_alpha(self, value):
+    for o in _get_target_objs(bpy.context):
+        if hasattr(o, 'color'):
+            c = list(o.color)
+            if len(c) < 4:
+                c = c + [1.0] * (4 - len(c))
+            c[3] = value
+            o.color = tuple(c)
+    for a in bpy.context.screen.areas:
+        if a.type == 'VIEW_3D':
+            a.tag_redraw()
+
+def get_object_color(self):
+    obj = bpy.context.active_object
+    if obj and hasattr(obj, 'color'):
+        return obj.color
+    return (1.0, 1.0, 1.0, 1.0)
+
+def set_object_color(self, value):
+    for o in _get_target_objs(bpy.context):
+        if hasattr(o, 'color'):
+            o.color = tuple(value)
+    for a in bpy.context.screen.areas:
+        if a.type == 'VIEW_3D':
+            for space in a.spaces:
+                if space.type == 'VIEW_3D' and hasattr(space, 'shading'):
+                    space.shading.color_type = 'OBJECT'
+            a.tag_redraw()
+
+
 class ShadingUIProps(PropertyGroup):
     show_viewport_shading: BoolProperty(name="视图着色方式", default=True)
     show_shading_options: BoolProperty(name="选项", default=False)
     show_object_shading: BoolProperty(name="物体着色", default=True)
-    show_stored_views: BoolProperty(name="存储视图", default=False)
+
+    object_display_type: EnumProperty(name="显示为", items=DISPLAY_TYPE_ITEMS, get=get_disp_type, set=set_disp_type)
+    object_show_wire: BoolProperty(name="线框", get=get_show_wire, set=set_show_wire)
+    object_show_retopology: BoolProperty(name="重拓扑", get=get_show_retopology, set=set_show_retopology)
+    object_show_in_front: BoolProperty(name="在前面", get=get_show_in_front, set=set_show_in_front)
+    object_is_shadow_catcher: BoolProperty(name="阴影捕捉", get=get_shadow_catcher, set=set_shadow_catcher)
+
+    object_alpha: FloatProperty(name="透明", min=0.0, max=1.0, precision=3, step=1, get=get_object_alpha, set=set_object_alpha)
+    object_color: FloatVectorProperty(name="视口颜色", subtype='COLOR', size=4, min=0.0, max=1.0, get=get_object_color, set=set_object_color)
 
 
 class SHADING_OT_SetObjectColorIndex(Operator):
@@ -71,9 +178,7 @@ class SHADING_OT_SetObjectColorIndex(Operator):
     def execute(self, context):
         if 0 <= self.color_index < len(PRESET_COLORS):
             r, g, b = PRESET_COLORS[self.color_index]
-            objs = [o for o in context.selected_objects if o.type in {'MESH', 'CURVE', 'SURFACE', 'FONT', 'META'}]
-            if not objs and context.object:
-                objs = [context.object]
+            objs = _get_target_objs(context)
 
             for o in objs:
                 alpha = o.color[3] if len(o.color) > 3 else 1.0
@@ -96,9 +201,7 @@ class SHADING_OT_RandomizeObjectColor(Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        objs = [o for o in context.selected_objects if o.type in {'MESH', 'CURVE', 'SURFACE', 'FONT', 'META'}]
-        if not objs and context.object:
-            objs = [context.object]
+        objs = _get_target_objs(context)
 
         if not objs:
             self.report({'WARNING'}, "未选择任何物体")
@@ -131,9 +234,7 @@ class SHADING_OT_RandomizeCollectionColor(Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        objs = [o for o in context.selected_objects if o.type in {'MESH', 'CURVE', 'SURFACE', 'FONT', 'META'}]
-        if not objs and context.object:
-            objs = [context.object]
+        objs = _get_target_objs(context)
 
         if not objs:
             self.report({'WARNING'}, "未选择任何物体")
@@ -172,9 +273,7 @@ class SHADING_OT_ResetObjectColor(Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        objs = [o for o in context.selected_objects if o.type in {'MESH', 'CURVE', 'SURFACE', 'FONT', 'META'}]
-        if not objs and context.object:
-            objs = [context.object]
+        objs = _get_target_objs(context)
         for o in objs:
             o.color = (1.0, 1.0, 1.0, 1.0)
         for a in context.screen.areas:
@@ -188,37 +287,16 @@ class VIEW3D_PT_QuickShadingPopover(Panel):
     bl_label = "着色弹出菜单"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'WINDOW'
-    bl_ui_units_x = 13
+    bl_ui_units_x = 12
 
     def draw(self, context):
         layout = self.layout
         space = context.space_data
         shading = getattr(space, 'shading', None)
-        overlay = getattr(space, 'overlay', None)
         obj = context.active_object
         props = getattr(context.scene, 'um_shading_props', None)
         if not props:
             return
-
-        # 顶栏快捷 4 种着色模式切换
-        if shading:
-            row_modes = layout.row(align=True)
-            row_modes.scale_y = 1.15
-            row_modes.prop(shading, "type", expand=True)
-
-        # 渲染引擎切换
-        row_eng = layout.row(align=True)
-        engine_items = [e.identifier for e in context.scene.render.bl_rna.properties['engine'].enum_items]
-        eevee_name = 'BLENDER_EEVEE_NEXT' if 'BLENDER_EEVEE_NEXT' in engine_items else 'BLENDER_EEVEE'
-        row_eng.prop_enum(context.scene.render, "engine", eevee_name, text="Eevee", icon='SHADING_RENDERED')
-        row_eng.prop_enum(context.scene.render, "engine", 'CYCLES', text="Cycles", icon='SCENE')
-        row_eng.popover(panel="VIEW3D_PT_shading", text="", icon='PREFERENCES')
-
-        # 显示网格与简化
-        row_mesh = layout.row(align=True)
-        if overlay:
-            row_mesh.prop(overlay, "show_floor", text="显示网格", icon='GRID', toggle=True)
-        row_mesh.prop(context.scene.render, "use_simplify", text="简化", icon='RNA', toggle=True)
 
         # =========================================================================
         # 1. 视图着色方式 (可折叠)
@@ -228,7 +306,7 @@ class VIEW3D_PT_QuickShadingPopover(Panel):
         icon_view = 'DOWNARROW_HLT' if props.show_viewport_shading else 'RIGHTARROW'
         h_view.prop(props, "show_viewport_shading", text="视图着色方式", icon=icon_view, emboss=False)
 
-        if props.show_viewport_shading and shading and shading.type == 'SOLID':
+        if props.show_viewport_shading and shading:
             # 光照：横排三按钮平铺
             box_view.label(text="光照")
             row_light = box_view.row(align=True)
@@ -237,7 +315,11 @@ class VIEW3D_PT_QuickShadingPopover(Panel):
             row_light.prop_enum(shading, "light", 'FLAT', text="平面")
 
             if shading.light in {'STUDIO', 'MATCAP'}:
-                box_view.template_icon_view(shading, "studio_light", show_labels=False)
+                sub = box_view.row(align=True)
+                sub.scale_y = 0.55
+                sub.template_icon_view(shading, "studio_light", scale_popup=2.0)
+                if shading.light == 'MATCAP':
+                    sub.operator("view3d.toggle_matcap_flip", text="", icon='ARROW_LEFTRIGHT')
 
             # 线框颜色：横排三按钮平铺
             if hasattr(shading, 'wireframe_color_type'):
@@ -294,36 +376,23 @@ class VIEW3D_PT_QuickShadingPopover(Panel):
         h_obj.prop(props, "show_object_shading", text="物体着色", icon=icon_obj, emboss=False)
 
         if props.show_object_shading and obj:
-            # 四格扁平切换按钮
-            grid_obj = box_obj.grid_flow(columns=2, align=True)
-            grid_obj.prop(obj, "show_wire", text="线框", toggle=True)
-            grid_obj.prop(obj, "show_in_front", text="在前面", toggle=True)
+            # 单排四按钮：线框、重拓扑、在前面、阴影捕捉 (同时控制全部选中物体)
+            row_four = box_obj.row(align=True)
+            row_four.prop(props, "object_show_wire", text="线框", toggle=True)
+            row_four.prop(props, "object_show_retopology", text="重拓扑", toggle=True)
+            row_four.prop(props, "object_show_in_front", text="在前面", toggle=True)
+            row_four.prop(props, "object_is_shadow_catcher", text="阴影捕捉", toggle=True)
 
-            if overlay and hasattr(overlay, 'show_retopology'):
-                grid_obj.prop(overlay, "show_retopology", text="重拓扑", toggle=True)
-            elif hasattr(obj, 'show_all_edges'):
-                grid_obj.prop(obj, "show_all_edges", text="重拓扑", toggle=True)
-            else:
-                grid_obj.label(text="")
-
-            if hasattr(obj, 'is_shadow_catcher'):
-                grid_obj.prop(obj, "is_shadow_catcher", text="阴影捕捉", toggle=True)
-            else:
-                grid_obj.label(text="")
-
-            # 显示为 (横排四按钮平铺)
+            # 显示为 (横排四按钮平铺，同时设置全部选中物体)
             box_obj.label(text="显示为")
             row_disp = box_obj.row(align=True)
-            row_disp.prop_enum(obj, "display_type", 'BOUNDS', text="边界范围")
-            row_disp.prop_enum(obj, "display_type", 'WIRE', text="线框")
-            row_disp.prop_enum(obj, "display_type", 'SOLID', text="实体")
-            row_disp.prop_enum(obj, "display_type", 'TEXTURED', text="纹理")
+            row_disp.prop(props, "object_display_type", expand=True)
 
             # 视口颜色 (12 色纯色方块调色板)
             box_obj.label(text="视口颜色")
             pcoll = preview_collections.get("main")
             pal_row = box_obj.row(align=True)
-            pal_row.scale_y = 1.25
+            pal_row.scale_y = 0.95
             for i in range(12):
                 icon_id = pcoll[f"color_{i+1:02d}"].icon_id if pcoll and f"color_{i+1:02d}" in pcoll else 0
                 btn = pal_row.operator("shading.set_object_color_index", text="", icon_value=icon_id)
@@ -331,22 +400,14 @@ class VIEW3D_PT_QuickShadingPopover(Panel):
 
             # 随机化颜色工具
             col_tools = box_obj.column(align=True)
-            col_tools.scale_y = 1.15
             col_tools.operator("shading.randomize_object_color", text="随机化颜色", icon='COLOR')
             col_tools.operator("shading.randomize_collection_color", text="为物体集合添加随机颜色", icon='GROUP')
 
-            # 透明度行
+            # 透明度行 (同时控制所有选中物体)
             alpha_row = box_obj.row(align=True)
-            alpha_row.scale_y = 1.15
-            alpha_row.prop(obj, "color", index=3, text="透明", slider=True)
-            alpha_row.prop(obj, "color", text="")
+            alpha_row.prop(props, "object_alpha", text="透明", slider=True)
+            alpha_row.prop(props, "object_color", text="")
             alpha_row.operator("shading.reset_object_color", text="", icon='X')
-
-            # 存储视图 (可折叠)
-            box_stored = box_obj.box()
-            h_stored = box_stored.row(align=True)
-            icon_stored = 'DOWNARROW_HLT' if props.show_stored_views else 'RIGHTARROW'
-            h_stored.prop(props, "show_stored_views", text="存储视图", icon=icon_stored, emboss=False)
 
 
 classes = (
