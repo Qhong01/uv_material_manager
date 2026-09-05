@@ -1,9 +1,322 @@
+import os
+import json
+import math
 import bpy
 import bmesh
 from collections import OrderedDict
 import traceback
 from bpy.types import Operator, PropertyGroup
-from bpy.props import BoolProperty, StringProperty, PointerProperty
+from bpy.props import BoolProperty, StringProperty, PointerProperty, FloatProperty
+
+
+# =========================================================================
+# 0. 智能环选持久化配置与管理
+# =========================================================================
+SMART_LOOP_CONFIG_FILENAME = "smart_loop_config.json"
+SMART_LOOP_DEFAULTS = {
+    "max_angle": 60.0,
+    "stop_at_seams": False,
+    "stop_at_sharps": False,
+    "stop_at_material_boundaries": False,
+    "prioritize_sharp_loop": True,
+}
+
+def get_smart_loop_config_path():
+    addon_dir = os.path.dirname(__file__)
+    return os.path.join(addon_dir, SMART_LOOP_CONFIG_FILENAME)
+
+def load_smart_loop_config():
+    fp = get_smart_loop_config_path()
+    if os.path.exists(fp):
+        try:
+            with open(fp, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    res = dict(SMART_LOOP_DEFAULTS)
+                    res.update(data)
+                    return res
+        except Exception:
+            pass
+    return dict(SMART_LOOP_DEFAULTS)
+
+def save_smart_loop_config(cfg):
+    fp = get_smart_loop_config_path()
+    tmp_fp = fp + ".tmp"
+    try:
+        with open(tmp_fp, 'w', encoding='utf-8') as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        if os.path.exists(fp):
+            os.replace(tmp_fp, fp)
+        else:
+            os.rename(tmp_fp, fp)
+    except Exception:
+        if os.path.exists(tmp_fp):
+            try:
+                os.remove(tmp_fp)
+            except Exception:
+                pass
+
+
+def is_material_boundary(edge):
+    faces = edge.link_faces
+    if len(faces) == 2:
+        return faces[0].material_index != faces[1].material_index
+    return False
+
+def find_topo_opposite(vert, incoming_edge):
+    if len(vert.link_faces) == 4 and len(vert.link_edges) == 4:
+        inc_faces = set(incoming_edge.link_faces)
+        for e in vert.link_edges:
+            if e != incoming_edge and not inc_faces.intersection(e.link_faces):
+                return e
+    return None
+
+class MESH_OT_SmartLoopSelect(Operator):
+    bl_idname = "mesh.smart_loop_select"
+    bl_label = "智能环选"
+    bl_description = "智能穿透循环选择边：遇到极点或三角面自动按几何走向穿透延伸；如果当前选中的是锐边，则优先选中整圈锐边特征"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    max_angle: FloatProperty(
+        name="最大偏角",
+        description="遇到极点或三角面分叉时，允许向前穿透的最大偏折角度",
+        default=math.radians(60.0),
+        min=math.radians(10.0),
+        max=math.radians(120.0),
+        subtype='ANGLE',
+        unit='ROTATION'
+    )
+    stop_at_seams: BoolProperty(
+        name="遇到缝合边停止",
+        description="遇到 UV 缝合边时停止继续穿透",
+        default=False
+    )
+    stop_at_sharps: BoolProperty(
+        name="遇到锐边停止",
+        description="遇到标记为锐边的边时停止继续穿透（普通边模式生效）",
+        default=False
+    )
+    stop_at_material_boundaries: BoolProperty(
+        name="遇到材质边界停止",
+        description="遇到不同材质分配的面之间的交界边时停止",
+        default=False
+    )
+    prioritize_sharp_loop: BoolProperty(
+        name="锐边特征优先",
+        description="当选中的起始边本身为锐边时，优先追踪整圈锐边特征",
+        default=True
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return (context.mode == 'EDIT_MESH' and 
+                context.active_object and 
+                context.active_object.type == 'MESH')
+
+    def invoke(self, context, event):
+        cfg = load_smart_loop_config()
+        self.max_angle = math.radians(cfg.get("max_angle", 60.0))
+        self.stop_at_seams = cfg.get("stop_at_seams", False)
+        self.stop_at_sharps = cfg.get("stop_at_sharps", False)
+        self.stop_at_material_boundaries = cfg.get("stop_at_material_boundaries", False)
+        self.prioritize_sharp_loop = cfg.get("prioritize_sharp_loop", True)
+        return self.execute(context)
+
+    def draw(self, context):
+        layout = self.layout
+        col = layout.column(align=True)
+        col.prop(self, "max_angle")
+        col.prop(self, "prioritize_sharp_loop")
+        
+        box = layout.box()
+        box.label(text="阻断条件开关:")
+        box.prop(self, "stop_at_seams")
+        box.prop(self, "stop_at_sharps")
+        box.prop(self, "stop_at_material_boundaries")
+
+    def execute(self, context):
+        # 持久化当前设置
+        cfg = {
+            "max_angle": math.degrees(self.max_angle),
+            "stop_at_seams": self.stop_at_seams,
+            "stop_at_sharps": self.stop_at_sharps,
+            "stop_at_material_boundaries": self.stop_at_material_boundaries,
+            "prioritize_sharp_loop": self.prioritize_sharp_loop,
+        }
+        save_smart_loop_config(cfg)
+
+        obj = context.active_object
+        mesh = obj.data
+        bm = bmesh.from_edit_mesh(mesh)
+        bm.verts.ensure_lookup_table()
+        bm.edges.ensure_lookup_table()
+        bm.faces.ensure_lookup_table()
+
+        # 确保处于边选择模式
+        context.tool_settings.mesh_select_mode = (False, True, False)
+
+        initial_selected_edges = [e for e in bm.edges if e.select]
+        if not initial_selected_edges:
+            self.report({'WARNING'}, "请先选择至少一条边")
+            return {'CANCELLED'}
+
+        max_angle_deg = math.degrees(self.max_angle)
+        all_selected_edges = set(initial_selected_edges)
+
+        for start_edge in initial_selected_edges:
+            is_start_sharp = self.prioritize_sharp_loop and (not start_edge.smooth)
+
+            for start_vert in start_edge.verts:
+                curr_edge = start_edge
+                curr_vert = start_vert
+                prev_vert = curr_edge.other_vert(curr_vert)
+                visited_branch_edges = {start_edge}
+
+                while True:
+                    # 检查到达的当前顶点是否碰到了阻断边界（例如缝合边、锐边、材质边界）
+                    # 只要相连的边中有阻断标记，就表示遇到了交汇边界，在此停止穿透
+                    if self.stop_at_seams and any(e.seam for e in curr_vert.link_edges if e != curr_edge):
+                        break
+                    if self.stop_at_sharps and (not is_start_sharp) and any((not e.smooth) for e in curr_vert.link_edges if e != curr_edge):
+                        break
+                    if self.stop_at_material_boundaries:
+                        mat_faces = curr_vert.link_faces
+                        if len(mat_faces) > 1 and len({f.material_index for f in mat_faces}) > 1:
+                            break
+                        if any(is_material_boundary(e) for e in curr_vert.link_edges if e != curr_edge):
+                            break
+
+                    vec_in = curr_vert.co - prev_vert.co
+                    if vec_in.length_squared < 1e-8:
+                        break
+                    vec_in.normalize()
+
+                    candidates = [e for e in curr_vert.link_edges if e != curr_edge and e not in visited_branch_edges]
+                    if not candidates:
+                        break
+
+                    # 1. 锐边特征环优先追踪模式 (当起点为锐边)
+                    if is_start_sharp:
+                        sharp_cands = [e for e in candidates if (not e.smooth)]
+                        valid_sharp = []
+                        for e in sharp_cands:
+                            if self.stop_at_seams and e.seam:
+                                continue
+                            if self.stop_at_material_boundaries and is_material_boundary(e):
+                                continue
+
+                            other_v = e.other_vert(curr_vert)
+                            vec_out = other_v.co - curr_vert.co
+                            if vec_out.length_squared < 1e-8:
+                                continue
+                            vec_out.normalize()
+                            dot = max(-1.0, min(1.0, vec_in.dot(vec_out)))
+                            valid_sharp.append((dot, e, other_v))
+
+                        if not valid_sharp:
+                            break
+
+                        valid_sharp.sort(key=lambda x: x[0], reverse=True)
+                        chosen_edge = valid_sharp[0][1]
+                        chosen_other_v = valid_sharp[0][2]
+
+                        if chosen_edge in all_selected_edges:
+                            all_selected_edges.add(chosen_edge)
+                            break
+
+                        all_selected_edges.add(chosen_edge)
+                        visited_branch_edges.add(chosen_edge)
+                        prev_vert = curr_vert
+                        curr_vert = chosen_other_v
+                        curr_edge = chosen_edge
+                        continue
+
+                    # 2. 普通表面边：拓扑扇区排除 + 曲面切线投影几何平滑穿透模式
+                    # 拓扑扇区排除：当顶点具有 >= 4 条边时，排除与进向边共面的侧翼边（90°侧转边），只在对向扇区中选边
+                    if len(curr_vert.link_edges) >= 4:
+                        inc_faces = set(curr_edge.link_faces)
+                        opposite_candidates = [e for e in candidates if not inc_faces.intersection(e.link_faces)]
+                        if opposite_candidates:
+                            candidates = opposite_candidates
+
+                    # 计算顶点法线与局部曲面切平面基底
+                    vert_norm = curr_vert.normal
+                    t_in = vec_in - vec_in.dot(vert_norm) * vert_norm
+                    if t_in.length_squared > 1e-6:
+                        t_in.normalize()
+                    else:
+                        t_in = vec_in
+
+                    topo_opposite = find_topo_opposite(curr_vert, curr_edge)
+
+                    valid_candidates = []
+                    for e in candidates:
+                        if self.stop_at_seams and e.seam:
+                            continue
+                        if self.stop_at_sharps and (not e.smooth):
+                            continue
+                        if self.stop_at_material_boundaries and is_material_boundary(e):
+                            continue
+
+                        other_v = e.other_vert(curr_vert)
+                        vec_out = other_v.co - curr_vert.co
+                        if vec_out.length_squared < 1e-8:
+                            continue
+                        vec_out.normalize()
+
+                        # 切平面切向点积与 3D 点积加权计算
+                        t_out = vec_out - vec_out.dot(vert_norm) * vert_norm
+                        if t_out.length_squared > 1e-6:
+                            t_out.normalize()
+                        else:
+                            t_out = vec_out
+
+                        dot_tangent = max(-1.0, min(1.0, t_in.dot(t_out)))
+                        dot_3d = max(-1.0, min(1.0, vec_in.dot(vec_out)))
+
+                        # 综合得分：以曲面切线流向为主(70%)，3D空间为辅(30%)
+                        score = dot_tangent * 0.7 + dot_3d * 0.3
+                        angle_deg = math.degrees(math.acos(dot_3d))
+
+                        if angle_deg <= max_angle_deg or dot_tangent > 0.5:
+                            valid_candidates.append((score, e, other_v, angle_deg, dot_tangent))
+
+                    if not valid_candidates:
+                        break
+
+                    # 排序
+                    valid_candidates.sort(key=lambda x: x[0], reverse=True)
+
+                    chosen_edge = valid_candidates[0][1]
+                    chosen_other_v = valid_candidates[0][2]
+
+                    # 如果标准四边形对边在有效候选列表中且表现优良，优先使用标准对边
+                    if topo_opposite:
+                        for s, e, ov, adeg, dtan in valid_candidates:
+                            if e == topo_opposite and (adeg <= max_angle_deg or dtan > 0.4):
+                                chosen_edge = e
+                                chosen_other_v = ov
+                                break
+
+                    if chosen_edge in all_selected_edges:
+                        all_selected_edges.add(chosen_edge)
+                        break
+
+                    all_selected_edges.add(chosen_edge)
+                    visited_branch_edges.add(chosen_edge)
+                    prev_vert = curr_vert
+                    curr_vert = chosen_other_v
+                    curr_edge = chosen_edge
+
+        for e in all_selected_edges:
+            e.select = True
+
+        bmesh.update_edit_mesh(mesh)
+        context.view_layer.update()
+        self.report({'INFO'}, f"智能环选已选中 {len(all_selected_edges)} 条边")
+        return {'FINISHED'}
 
 
 # =========================================================================
@@ -452,6 +765,7 @@ classes = (
     HOLE_FILL_OT_operator,
     MATERIAL_OT_UltraCombine,
     OUTLINER_OT_ToggleOperator,
+    MESH_OT_SmartLoopSelect,
 )
 
 def safe_register_class(cls):

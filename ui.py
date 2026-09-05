@@ -134,7 +134,11 @@ class VIEW3D_PT_UltimateManager(Panel):
         tools_row.operator("custom.clear_normals", icon='NORMALS_FACE', text="清理法线")
         tools_row.popover(panel="VIEW3D_PT_QuickShadingPopover", text="着色", icon='SHADING_SOLID')
 
-        # 1. 动态自定义分屏工具栏 (第二排：只放分屏功能按键，右侧保留配置齿轮)
+        # 新增第二排建模与选择工具栏 (第 1 个放置“智能环选”，右侧留空给后续新增命令)
+        tools_row2 = layout.row(align=True)
+        tools_row2.operator("mesh.smart_loop_select", text="智能环选", icon='MOD_EDGESPLIT')
+
+        # 1. 动态自定义分屏工具栏 (第三排：只放分屏功能按键，右侧保留配置齿轮)
         from .workspace import get_editor_icon
 
         top_row = layout.row(align=True)

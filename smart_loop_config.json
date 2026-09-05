@@ -1,0 +1,7 @@
+{
+  "max_angle": 82.8900009747375,
+  "stop_at_seams": true,
+  "stop_at_sharps": true,
+  "stop_at_material_boundaries": false,
+  "prioritize_sharp_loop": true
+}
