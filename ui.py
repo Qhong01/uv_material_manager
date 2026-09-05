@@ -132,8 +132,7 @@ class VIEW3D_PT_UltimateManager(Panel):
             tools_row.operator("view3d.toggle_outliner", text="大纲视图", icon='OUTLINER')
 
         # 1. 动态自定义分屏与着色工具栏
-        from .workspace import ensure_custom_layouts_loaded, get_editor_icon
-        ensure_custom_layouts_loaded(context.scene)
+        from .workspace import get_editor_icon
 
         top_row = layout.row(align=True)
         active_id = getattr(context.window_manager, "um_active_layout_id", "")
