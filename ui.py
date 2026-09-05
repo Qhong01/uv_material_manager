@@ -361,18 +361,16 @@ class VIEW3D_PT_MaterialManager(Panel):
 
     def draw_header(self, context):
         layout = self.layout
-        layout.popover(panel="VIEW3D_PT_QuickShadingPopover", text="", icon='SHADING_SOLID')
         layout.operator("material.reload_all_textures", text="", icon='FILE_REFRESH', emboss=False)
 
     def draw(self, context):
         layout = self.layout
         props = context.scene.um_props
         
-        # 0. 菜单最顶上一键刷新全部材质贴图与着色菜单
+        # 0. 菜单最顶上一键刷新全部材质贴图
         top_row = layout.row(align=True)
         top_row.scale_y = 1.15
         top_row.operator("material.reload_all_textures", text="刷新全部贴图", icon='FILE_REFRESH')
-        top_row.popover(panel="VIEW3D_PT_QuickShadingPopover", text="着色设置", icon='SHADING_SOLID')
 
         # 主容器
         main_box = layout.box()
