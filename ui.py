@@ -119,7 +119,19 @@ class VIEW3D_PT_UltimateManager(Panel):
         layout = self.layout
         props = context.scene.um_props
         
-        # 顶部工具栏初始化
+        # 0. 常用建模与大纲视图工具栏 (拍平面、合并材质、填充孔洞、大纲视图)
+        tools_row = layout.row(align=True)
+        tools_row.operator("mesh.flatten_face_by_three_vertices", text="拍平面", icon='SNAP_FACE')
+        tools_row.operator("object.ultra_material_combine", text="合并材质", icon='NODETREE')
+        tools_row.operator("mesh.zhineng_fill_holes", text="填充孔洞", icon='SELECT_DIFFERENCE')
+
+        outliner_state = getattr(context.scene, "outliner_state", None)
+        if outliner_state and outliner_state.is_open:
+            tools_row.operator("view3d.toggle_outliner", text="关闭大纲", icon='X')
+        else:
+            tools_row.operator("view3d.toggle_outliner", text="大纲视图", icon='OUTLINER')
+
+        # 1. 顶部工作区与着色工具栏
         top_row = layout.row(align=True)
         top_row.operator(
             "workspace.toggle_uv_layout", 
