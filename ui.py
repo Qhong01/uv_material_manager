@@ -131,20 +131,48 @@ class VIEW3D_PT_UltimateManager(Panel):
         else:
             tools_row.operator("view3d.toggle_outliner", text="大纲视图", icon='OUTLINER')
 
-        # 1. 顶部工作区与着色工具栏
+        # 1. 动态自定义分屏与着色工具栏
+        from .workspace import ensure_custom_layouts_loaded, get_editor_icon
+        ensure_custom_layouts_loaded(context.scene)
+
         top_row = layout.row(align=True)
-        top_row.operator(
-            "workspace.toggle_uv_layout", 
-            icon='UV' if not context.scene.uv_layout_active else 'CANCEL',
-            text="切换UV布局"
-        )
-        top_row.operator(
-            "workspace.toggle_material_layout", 
-            icon='NODETREE' if not context.scene.uv_layout_active else 'CANCEL',
-            text="切换材质布局"
-        )
+        active_id = getattr(context.window_manager, "um_active_layout_id", "")
+        custom_layouts = getattr(context.scene, "um_custom_layouts", [])
+
+        if len(custom_layouts) == 0:
+            top_row.operator("workspace.add_custom_layout", text="添加分屏视图", icon='ADD')
+        else:
+            for item in custom_layouts:
+                is_active = (active_id == item.id)
+                icon_name = get_editor_icon(item.editor_type)
+                btn = top_row.operator("workspace.toggle_custom_layout", text=item.name, icon=icon_name, depress=is_active)
+                btn.item_id = item.id
+
         top_row.operator("custom.clear_normals", icon='NORMALS_FACE', text="清除法线")
         top_row.popover(panel="VIEW3D_PT_QuickShadingPopover", text="着色菜单", icon='SHADING_SOLID')
+        top_row.prop(context.scene, "um_show_layout_settings", text="", icon='PREFERENCES' if not context.scene.um_show_layout_settings else 'DOWNARROW_HLT')
+
+        # 2. 分屏视图管理配置展开面板
+        if getattr(context.scene, "um_show_layout_settings", False):
+            cfg_box = layout.box()
+            cfg_hdr = cfg_box.row(align=True)
+            cfg_hdr.label(text="自定义分屏视图管理器", icon='PREFERENCES')
+            cfg_hdr.operator("workspace.add_custom_layout", text="添加新项", icon='ADD')
+
+            if len(custom_layouts) == 0:
+                cfg_box.label(text="暂未添加任何分屏视图，点击右上角「添加新项」开始配置", icon='INFO')
+            else:
+                for idx, item in enumerate(custom_layouts):
+                    ibox = cfg_box.box()
+                    r1 = ibox.row(align=True)
+                    r1.prop(item, "name", text="名称")
+                    r1.prop(item, "editor_type", text="")
+
+                    r2 = ibox.row(align=True)
+                    r2.prop(item, "direction", expand=True)
+                    r2.prop(item, "ratio", text="占比", slider=True)
+                    del_op = r2.operator("workspace.remove_custom_layout", text="", icon='TRASH')
+                    del_op.index = idx
 
         # 自动平滑功能区
         smooth_box = layout.box()
