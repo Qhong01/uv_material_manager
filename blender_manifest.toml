@@ -1,0 +1,13 @@
+﻿schema_version = "1.0.0"
+
+id = "uv_material_manager"
+version = "1.0.0"
+name = "UV Material Manager"
+tagline = "批量UV与材质管理（含修改器同步与状态显示）"
+maintainer = "xiaoshui"
+type = "add-on"
+
+blender_version_min = "4.3.0"
+
+license = ["SPDX:GPL-3.0-or-later"]
+tags = ["UV", "Material", "Mesh"]
