@@ -148,13 +148,6 @@ class ModifierAutoSync:
                 cls._snapshots[(active_obj.name, mod.name)] = cls.get_snapshot(mod)
             return
 
-        active_touched = False
-        for update in depsgraph.updates:
-            orig = getattr(update.id, "original", update.id)
-            if orig == active_obj or orig == active_obj.data:
-                active_touched = True
-                break
-
         cls._is_syncing = True
         try:
             for mod in active_obj.modifiers:
@@ -191,34 +184,6 @@ class ModifierAutoSync:
                                         cls._snapshots[target_key] = cls.get_snapshot(target_mod)
                                 except Exception:
                                     pass
-                elif active_touched:
-                    # 即使 active_obj 本身的值没有变动 (例如从 1 重新输入 1)，但用户触发了活动物体的交互/更新
-                    # 检查是否有其它选中物体的参数与当前活动物体不一致，若不一致则自动同步为当前活动物体的值
-                    for prop_id, curr_val in curr_snap.items():
-                        raw_val = getattr(mod, prop_id)
-                        for target_obj in other_selected:
-                            target_mod = target_obj.modifiers.get(mod.name)
-                            if not target_mod:
-                                for m in target_obj.modifiers:
-                                    if m.type == mod.type:
-                                        target_mod = m
-                                        break
-                            if target_mod and hasattr(target_mod, prop_id):
-                                target_val = cls.serialize_value(getattr(target_mod, prop_id, None))
-                                if target_val != curr_val:
-                                    try:
-                                        if isinstance(curr_val, tuple):
-                                            setattr(target_mod, prop_id, list(raw_val))
-                                        else:
-                                            setattr(target_mod, prop_id, raw_val)
-                                        target_key = (target_obj.name, target_mod.name)
-                                        if target_key in cls._snapshots:
-                                            cls._snapshots[target_key][prop_id] = curr_val
-                                        else:
-                                            cls._snapshots[target_key] = cls.get_snapshot(target_mod)
-                                    except Exception:
-                                        pass
-
                 cls._snapshots[key] = curr_snap
         finally:
             cls._is_syncing = False
