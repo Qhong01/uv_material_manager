@@ -174,6 +174,12 @@ class UVAutoSync:
     _is_syncing = False
 
     @classmethod
+    def reset(cls):
+        cls._last_active_index.clear()
+        cls._last_render_index.clear()
+        cls._is_syncing = False
+
+    @classmethod
     def record_active_index(cls, obj_name, idx):
         cls._last_active_index[obj_name] = idx
 
@@ -247,6 +253,11 @@ class UVAutoSync:
 @persistent
 def uv_depsgraph_update_handler(scene, depsgraph):
     UVAutoSync.update_handler(scene, depsgraph)
+
+
+@persistent
+def reset_uv_sync_state(_dummy):
+    UVAutoSync.reset()
 
 
 # =========================================================================
@@ -472,12 +483,8 @@ def sync_uv_layers(src_obj):
             while len(dst_layers) < target_count:
                 dst_layers.new(name=src_layers[len(dst_layers)].name)
 
-            while len(dst_layers) > target_count and len(dst_layers) > 1:
-                dst_layers.remove(dst_layers[-1])
-
-            for idx, dst_layer in enumerate(dst_layers):
-                if idx < len(src_layers):
-                    dst_layer.name = src_layers[idx].name
+            for idx in range(min(len(dst_layers), len(src_layers))):
+                dst_layers[idx].name = src_layers[idx].name
 
             if dst_layers:
                 dst_layers.active_index = min(src_active_idx, len(dst_layers)-1)
@@ -775,11 +782,17 @@ def register():
 
     if uv_depsgraph_update_handler not in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.append(uv_depsgraph_update_handler)
+    if reset_uv_sync_state not in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.append(reset_uv_sync_state)
 
 
 def unregister():
     if uv_depsgraph_update_handler in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.remove(uv_depsgraph_update_handler)
+    if reset_uv_sync_state in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(reset_uv_sync_state)
+
+    UVAutoSync.reset()
 
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)

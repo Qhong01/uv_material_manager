@@ -335,6 +335,7 @@ class FLATTEN_FACE_OT_operator(Operator):
                     vert.co = project_to_plane(vert.co)
                     moved_verts += 1
 
+        bm.normal_update()
         bmesh.update_edit_mesh(mesh)
         context.view_layer.update()
         self.report({'INFO'}, f"成功拍平 {len(selected_faces)} 个面 ({moved_verts} 个顶点已对齐)")
@@ -427,6 +428,7 @@ class HOLE_FILL_OT_operator(Operator):
                     except Exception:
                         continue
 
+            bm.normal_update()
             bm.to_mesh(mesh)
             mesh.update()
             bm.free()
@@ -458,7 +460,7 @@ class HOLE_FILL_OT_operator(Operator):
 class MATERIAL_OT_UltraCombine(Operator):
     bl_idname = "object.ultra_material_combine"
     bl_label = "合并材质"
-    bl_description = "智能遍历选中网格物体，重新映射材质槽并合并创建主材质节点树"
+    bl_description = "遍历选中网格物体，在不改动原材质槽的情况下创建主材质节点树"
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
@@ -468,15 +470,14 @@ class MATERIAL_OT_UltraCombine(Operator):
                 self.report({'ERROR'}, "未发现有效材质（需包含节点树）")
                 return {'CANCELLED'}
 
-            self.remap_material_slots(context, global_materials)
             master_mat = self.create_master_material(global_materials)
 
             if master_mat:
                 self.report({'INFO'}, f"主材质创建成功: {master_mat.name}")
-            else:
-                self.report({'WARNING'}, "创建了空主材质（无有效节点）")
+                return {'FINISHED'}
 
-            return {'FINISHED'}
+            self.report({'ERROR'}, "无法创建主材质：所选材质没有可用的着色器输出")
+            return {'CANCELLED'}
 
         except Exception as e:
             self.report({'ERROR'}, f"严重错误: {str(e)}")
@@ -532,15 +533,60 @@ class MATERIAL_OT_UltraCombine(Operator):
 
             valid_materials = [m for m in materials if m and m.node_tree and len(m.node_tree.nodes) > 0]
             prev_node = None
+            added_groups = 0
 
             for idx, mat in enumerate(valid_materials):
+                mat_node = None
+                group_tree = None
                 try:
                     mat_node = nodes.new('ShaderNodeGroup')
-                    mat_node.node_tree = mat.node_tree.copy()
+                    group_tree = self.copy_material_tree_to_group(mat)
+                    if not group_tree:
+                        nodes.remove(mat_node)
+                        continue
+                    group_tree.interface.new_socket(
+                        name="Shader",
+                        in_out='OUTPUT',
+                        socket_type='NodeSocketShader',
+                    )
+
+                    material_output = next(
+                        (
+                            node
+                            for node in group_tree.nodes
+                            if node.type == 'OUTPUT_MATERIAL' and node.is_active_output
+                        ),
+                        None,
+                    )
+                    if not material_output:
+                        material_output = next(
+                            (node for node in group_tree.nodes if node.type == 'OUTPUT_MATERIAL'),
+                            None,
+                        )
+
+                    source_socket = None
+                    if material_output:
+                        for input_name in ('Surface', 'Volume'):
+                            output_input = material_output.inputs.get(input_name)
+                            if output_input and output_input.is_linked:
+                                source_socket = output_input.links[0].from_socket
+                                break
+
+                    if not source_socket:
+                        bpy.data.node_groups.remove(group_tree)
+                        nodes.remove(mat_node)
+                        continue
+
+                    group_output = group_tree.nodes.new('NodeGroupOutput')
+                    group_tree.links.new(source_socket, group_output.inputs['Shader'])
+                    for output in [node for node in group_tree.nodes if node.type == 'OUTPUT_MATERIAL']:
+                        group_tree.nodes.remove(output)
+
+                    mat_node.node_tree = group_tree
                     mat_node.name = f"{mat.name}_Group"
                     mat_node.location = (idx * 400, 300)
 
-                    if idx == 0:
+                    if prev_node is None:
                         links.new(mat_node.outputs[0], output_node.inputs['Surface'])
                         prev_node = mat_node
                     else:
@@ -550,13 +596,73 @@ class MATERIAL_OT_UltraCombine(Operator):
                         links.new(mat_node.outputs[0], mix_node.inputs[2])
                         links.new(mix_node.outputs[0], output_node.inputs['Surface'])
                         prev_node = mix_node
-                except Exception:
+                    added_groups += 1
+                except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+                    if mat_node:
+                        try:
+                            nodes.remove(mat_node)
+                        except (ReferenceError, RuntimeError):
+                            pass
+                    if group_tree:
+                        try:
+                            bpy.data.node_groups.remove(group_tree)
+                        except (ReferenceError, RuntimeError):
+                            pass
                     continue
 
-            return master_mat if valid_materials else None
+            if added_groups == 0:
+                bpy.data.materials.remove(master_mat)
+                return None
+            return master_mat
         except Exception:
             if 'master_mat' in locals() and master_mat:
                 bpy.data.materials.remove(master_mat)
+            return None
+
+    @staticmethod
+    def copy_material_tree_to_group(material):
+        """Copy an embedded material node tree into a reusable shader group."""
+        source_tree = material.node_tree
+        group_tree = bpy.data.node_groups.new(f"{material.name}_GroupTree", 'ShaderNodeTree')
+        node_mapping = {}
+
+        try:
+            for source_node in source_tree.nodes:
+                new_node = group_tree.nodes.new(source_node.bl_idname)
+                new_node.name = source_node.name
+                new_node.location = source_node.location
+                node_mapping[source_node] = new_node
+
+                for prop in source_node.bl_rna.properties:
+                    if prop.is_readonly or prop.identifier in {'inputs', 'outputs', 'name', 'location'}:
+                        continue
+                    try:
+                        setattr(new_node, prop.identifier, getattr(source_node, prop.identifier))
+                    except (AttributeError, TypeError, ValueError, RuntimeError):
+                        continue
+
+                for source_input in source_node.inputs:
+                    target_input = new_node.inputs.get(source_input.identifier)
+                    if not target_input or not hasattr(source_input, 'default_value'):
+                        continue
+                    try:
+                        target_input.default_value = source_input.default_value
+                    except (AttributeError, TypeError, ValueError):
+                        continue
+
+            for source_link in source_tree.links:
+                from_node = node_mapping.get(source_link.from_node)
+                to_node = node_mapping.get(source_link.to_node)
+                if not from_node or not to_node:
+                    continue
+                from_socket = from_node.outputs.get(source_link.from_socket.identifier)
+                to_socket = to_node.inputs.get(source_link.to_socket.identifier)
+                if from_socket and to_socket:
+                    group_tree.links.new(from_socket, to_socket)
+
+            return group_tree
+        except (RuntimeError, TypeError, ValueError):
+            bpy.data.node_groups.remove(group_tree)
             return None
 
     @staticmethod
@@ -574,6 +680,7 @@ class OUTLINER_OT_ToggleOperator(Operator):
     bl_idname = "view3d.toggle_outliner"
     bl_label = "切换大纲视图"
     bl_description = "切换大纲视图与属性视图的显示与隐藏"
+    bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
     def poll(cls, context):

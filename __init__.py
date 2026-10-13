@@ -1,7 +1,7 @@
 bl_info = {
     "name": "UV_Material_Manager",
     "author": "xiaoshui",
-    "version": (1, 0, 0),
+    "version": (1, 0, 1),
     "blender": (4, 3, 0),
     "location": "View3D > Sidebar > UV Tools",
     "description": "完整UV和材质管理（含材质数据同步和状态显示）",
