@@ -25,14 +25,6 @@ class StateManager:
             cls._instance = cls()
         return cls._instance
 
-    @classmethod
-    def reset(cls):
-        if cls._instance and cls._instance.pending_click:
-            pending_click = cls._instance.pending_click
-            if bpy.app.timers.is_registered(pending_click):
-                bpy.app.timers.unregister(pending_click)
-        cls._instance = None
-
 # 工具函数
 def select_material_objects_by_name(mat_name):
     """根据材质名称选择物体"""
@@ -74,7 +66,7 @@ class UMProperties(PropertyGroup):
                 data = json.loads(self.copied_uv_data)
                 if not all(k in data for k in ('uv','pin_uv')):
                     self.copied_uv_data = ""
-            except (json.JSONDecodeError, TypeError):
+            except:
                 self.copied_uv_data = ""
 
     edit_mode_selection: BoolProperty(default=False)
@@ -132,7 +124,6 @@ def update_selected_material(scene, depsgraph=None):
 # 重置并刷新材质信息函数 (文件打开事件)
 @persistent
 def reset_material_info(filepath=None, scene=None):
-    StateManager.reset()
     context = bpy.context
     if not hasattr(context, 'scene') or not context.scene:
         return
@@ -264,8 +255,6 @@ def register():
 
 # 注销函数
 def unregister():
-    StateManager.reset()
-
     if update_material_list_handler in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.remove(update_material_list_handler)
     if update_selected_material in bpy.app.handlers.depsgraph_update_post:

@@ -78,12 +78,6 @@ class ModifierAutoSync:
     _last_selection = ()
 
     @classmethod
-    def reset(cls):
-        cls._snapshots.clear()
-        cls._is_syncing = False
-        cls._last_selection = ()
-
-    @classmethod
     def serialize_value(cls, val):
         if val is None:
             return None
@@ -122,15 +116,6 @@ class ModifierAutoSync:
                 for mod in obj.modifiers:
                     key = (obj.name, mod.name)
                     cls._snapshots[key] = cls.get_snapshot(mod)
-
-    @staticmethod
-    def find_matching_modifier(source_mod, target_obj):
-        target_mod = target_obj.modifiers.get(source_mod.name)
-        if target_mod and target_mod.type == source_mod.type:
-            return target_mod
-
-        same_type = [mod for mod in target_obj.modifiers if mod.type == source_mod.type]
-        return same_type[0] if len(same_type) == 1 else None
 
     @classmethod
     def update_handler(cls, scene, depsgraph):
@@ -180,7 +165,12 @@ class ModifierAutoSync:
                     for prop_id, curr_val in changed_props:
                         raw_val = getattr(mod, prop_id)
                         for target_obj in other_selected:
-                            target_mod = cls.find_matching_modifier(mod, target_obj)
+                            target_mod = target_obj.modifiers.get(mod.name)
+                            if not target_mod:
+                                for m in target_obj.modifiers:
+                                    if m.type == mod.type:
+                                        target_mod = m
+                                        break
                             if target_mod and hasattr(target_mod, prop_id):
                                 try:
                                     if isinstance(curr_val, tuple):
@@ -202,11 +192,6 @@ class ModifierAutoSync:
 @persistent
 def depsgraph_update_handler(scene, depsgraph):
     ModifierAutoSync.update_handler(scene, depsgraph)
-
-
-@persistent
-def reset_modifier_sync_state(_dummy):
-    ModifierAutoSync.reset()
 
 
 # =========================================================================
@@ -383,7 +368,12 @@ class MODIFIER_OT_SyncToSelected(Operator):
 
         synced_count = 0
         for target_obj in selected_objs:
-            target_mod = ModifierAutoSync.find_matching_modifier(src_mod, target_obj)
+            target_mod = target_obj.modifiers.get(src_mod.name)
+            if not target_mod:
+                for m in target_obj.modifiers:
+                    if m.type == src_mod.type:
+                        target_mod = m
+                        break
             if not target_mod:
                 try:
                     target_mod = target_obj.modifiers.new(name=src_mod.name, type=src_mod.type)
@@ -1257,16 +1247,10 @@ def register():
 
     if depsgraph_update_handler not in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.append(depsgraph_update_handler)
-    if reset_modifier_sync_state not in bpy.app.handlers.load_post:
-        bpy.app.handlers.load_post.append(reset_modifier_sync_state)
 
 def unregister():
     if depsgraph_update_handler in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.remove(depsgraph_update_handler)
-    if reset_modifier_sync_state in bpy.app.handlers.load_post:
-        bpy.app.handlers.load_post.remove(reset_modifier_sync_state)
-
-    ModifierAutoSync.reset()
 
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)

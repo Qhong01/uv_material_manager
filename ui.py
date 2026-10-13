@@ -18,7 +18,6 @@ class CUSTOM_OT_ClearNormals(Operator):
     def execute(self, context):
         processed = 0
         original_active = context.active_object  # 记录原始活动物体
-        original_mode = context.mode
         
         # 遍历所有选中物体
         for obj in context.selected_objects:
@@ -46,8 +45,6 @@ class CUSTOM_OT_ClearNormals(Operator):
         
         # 恢复原始活动物体
         context.view_layer.objects.active = original_active
-        if original_mode == 'EDIT_MESH' and original_active:
-            bpy.ops.object.mode_set(mode='EDIT')
         self.report({'INFO'}, f"已处理 {processed} 个网格物体")
         return {'FINISHED'}
 
@@ -101,11 +98,10 @@ class OBJECT_OT_AutoSmooth(Operator):
                 self.report({'WARNING'}, f"{obj.name} 处理失败: {str(e)}")
                 continue
 
+        if original_mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode=original_mode)
         if original_active:
             context.view_layer.objects.active = original_active
-        if original_mode != 'OBJECT':
-            restore_mode = 'EDIT' if original_mode == 'EDIT_MESH' else original_mode
-            bpy.ops.object.mode_set(mode=restore_mode)
 
         context.view_layer.update()
         self.report({'INFO'}, f"成功应用 {int(self.angle)}° 自动平滑到 {processed} 个物体")

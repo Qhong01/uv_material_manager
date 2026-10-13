@@ -21,5 +21,3 @@ Desktop.ini
 *.blend@
 *.blend1
 *.blend2
-.live_reload_injector.py
-reload.flag

@@ -6,7 +6,6 @@ import bmesh
 import time
 from bpy.types import Operator, UIList
 from bpy.props import StringProperty
-from bpy.app.handlers import persistent
 from bpy_extras.io_utils import ExportHelper, ImportHelper
 from .utils import StateManager, select_material_objects_by_name
 
@@ -31,42 +30,6 @@ class MaterialTemplateManager:
         except Exception:
             return set()
 
-    @staticmethod
-    def _temporary_material_name(index):
-        name = f"__UVMM_CURRENT_{index:04d}"
-        while bpy.data.materials.get(name):
-            name = f"_{name}"
-        return name
-
-    @classmethod
-    def _load_library_materials(cls, path, names, reserved_names=()):
-        renamed_materials = []
-        conflict_names = list(dict.fromkeys([*names, *reserved_names]))
-        for index, name in enumerate(conflict_names):
-            material = bpy.data.materials.get(name)
-            if material:
-                renamed_materials.append((material, name))
-                material.name = cls._temporary_material_name(index)
-
-        try:
-            with bpy.data.libraries.load(path) as (data_from, data_to):
-                available = set(data_from.materials)
-                data_to.materials = [name for name in names if name in available]
-            loaded_materials = [material for material in data_to.materials if material]
-            return loaded_materials, renamed_materials
-        except Exception:
-            for material, original_name in renamed_materials:
-                material.name = original_name
-            raise
-
-    @staticmethod
-    def _cleanup_loaded_materials(loaded_materials, renamed_materials):
-        for material in loaded_materials:
-            if material and material.name in bpy.data.materials:
-                bpy.data.materials.remove(material, do_unlink=True)
-        for material, original_name in renamed_materials:
-            material.name = original_name
-
     @classmethod
     def save_template(cls, mat):
         if not mat:
@@ -75,18 +38,24 @@ class MaterialTemplateManager:
         mat.use_fake_user = True
 
         mats_to_save = {mat}
-        loaded_materials = []
-        renamed_materials = []
         if os.path.exists(p):
             try:
                 with bpy.data.libraries.load(p) as (data_from, _):
                     other_names = [str(n) for n in data_from.materials if str(n) != mat.name]
-                loaded_materials, renamed_materials = cls._load_library_materials(p, other_names)
-                mats_to_save.update(loaded_materials)
+
+                to_load = [n for n in other_names if n not in bpy.data.materials]
+                for n in other_names:
+                    if n in bpy.data.materials:
+                        mats_to_save.add(bpy.data.materials[n])
+
+                if to_load:
+                    with bpy.data.libraries.load(p) as (data_from, data_to):
+                        data_to.materials = to_load
+                    for loaded in data_to.materials:
+                        if loaded:
+                            mats_to_save.add(loaded)
             except Exception as e:
                 print("加载现有材质模板失败:", e)
-                cls._cleanup_loaded_materials(loaded_materials, renamed_materials)
-                return False
 
         try:
             bpy.data.libraries.write(p, mats_to_save, fake_user=True)
@@ -94,8 +63,6 @@ class MaterialTemplateManager:
         except Exception as e:
             print("保存材质模板库失败:", e)
             return False
-        finally:
-            cls._cleanup_loaded_materials(loaded_materials, renamed_materials)
 
     @classmethod
     def delete_template(cls, mat_name):
@@ -115,17 +82,28 @@ class MaterialTemplateManager:
                 pass
             return True
 
-        loaded_materials = []
-        renamed_materials = []
+        mats_to_save = set()
+        to_load = [n for n in remaining_names if n not in bpy.data.materials]
+        for n in remaining_names:
+            if n in bpy.data.materials:
+                mats_to_save.add(bpy.data.materials[n])
+
+        if to_load:
+            try:
+                with bpy.data.libraries.load(p) as (data_from, data_to):
+                    data_to.materials = to_load
+                for loaded in data_to.materials:
+                    if loaded:
+                        mats_to_save.add(loaded)
+            except Exception as e:
+                print("加载模板数据失败:", e)
+
         try:
-            loaded_materials, renamed_materials = cls._load_library_materials(p, remaining_names)
-            bpy.data.libraries.write(p, set(loaded_materials), fake_user=True)
+            bpy.data.libraries.write(p, mats_to_save, fake_user=True)
             return True
         except Exception as e:
             print("更新材质模板库失败:", e)
             return False
-        finally:
-            cls._cleanup_loaded_materials(loaded_materials, renamed_materials)
 
     @classmethod
     def rename_template(cls, old_name, new_name):
@@ -148,25 +126,40 @@ class MaterialTemplateManager:
         if new_name in all_names:
             return False
 
-        loaded_materials = []
-        renamed_materials = []
+        mats_to_save = set()
+        names_to_load = []
+        for n in all_names:
+            target_n = new_name if n == old_name else n
+            if target_n in bpy.data.materials:
+                mats_to_save.add(bpy.data.materials[target_n])
+            elif n in bpy.data.materials:
+                mat_in_mem = bpy.data.materials[n]
+                mat_in_mem.name = target_n
+                mats_to_save.add(mat_in_mem)
+            else:
+                names_to_load.append(n)
+
+        if names_to_load:
+            try:
+                with bpy.data.libraries.load(p) as (data_from, data_to):
+                    data_to.materials = list(names_to_load)
+
+                for orig_n, m in zip(names_to_load, data_to.materials):
+                    if not m:
+                        continue
+                    m.name = new_name if orig_n == old_name else orig_n
+                    m.use_fake_user = True
+                    mats_to_save.add(m)
+            except Exception as e:
+                print("加载待重命名模板失败:", e)
+                return False
+
         try:
-            loaded_materials, renamed_materials = cls._load_library_materials(
-                p,
-                all_names,
-                reserved_names=(new_name,),
-            )
-            for material in loaded_materials:
-                if material.name == old_name:
-                    material.name = new_name
-                    break
-            bpy.data.libraries.write(p, set(loaded_materials), fake_user=True)
+            bpy.data.libraries.write(p, mats_to_save, fake_user=True)
             return True
         except Exception as e:
             print("重命名材质模板库失败:", e)
             return False
-        finally:
-            cls._cleanup_loaded_materials(loaded_materials, renamed_materials)
 
     @classmethod
     def load_single_template(cls, mat_name):
@@ -427,13 +420,6 @@ class MATERIAL_OT_CreateNew(Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        edit_mesh_objects = []
-        if context.mode == 'EDIT_MESH':
-            edit_mesh_objects = [obj for obj in context.selected_objects if obj.type == 'MESH']
-            if not any(obj.data.total_face_sel for obj in edit_mesh_objects):
-                self.report({'WARNING'}, "请先选择面")
-                return {'CANCELLED'}
-
         new_mat = bpy.data.materials.new(name="Material")
         new_mat.use_nodes = True
         
@@ -446,18 +432,31 @@ class MATERIAL_OT_CreateNew(Operator):
 
         # 处理不同模式
         if context.mode == 'EDIT_MESH':
-            for obj in edit_mesh_objects:
-                bm = bmesh.from_edit_mesh(obj.data)
-                selected_faces = [face for face in bm.faces if face.select]
-                if not selected_faces:
+            # 确保至少选择一个面
+            if not context.active_object or not context.active_object.data.total_face_sel:
+                self.report({'WARNING'}, "请先选择面")
+                return {'CANCELLED'}
+            
+            # 遍历所有选中物体
+            for obj in context.selected_objects:
+                if obj.type != 'MESH':
                     continue
-
-                obj.data.materials.append(new_mat)
-                material_index = len(obj.data.materials) - 1
-                obj.active_material_index = material_index
-                for face in selected_faces:
-                    face.material_index = material_index
-                bmesh.update_edit_mesh(obj.data)
+                
+                # 进入物体模式设置材质
+                bpy.ops.object.mode_set(mode='OBJECT')
+                
+                # 添加材质槽（如果不存在）
+                if not obj.data.materials:
+                    obj.data.materials.append(new_mat)
+                else:
+                    # 追加新材质并设置为活动槽
+                    obj.data.materials.append(new_mat)
+                    obj.active_material_index = len(obj.data.materials) - 1
+                
+                # 返回编辑模式并分配材质
+                bpy.ops.object.mode_set(mode='EDIT')
+                bpy.ops.object.material_slot_assign()
+                
         else:
             # 对象模式默认处理
             for obj in context.selected_objects:
@@ -578,7 +577,6 @@ class MATERIAL_OT_ExportTemplateLibrary(Operator, ExportHelper):
     bl_idname = "material.export_template_library"
     bl_label = "导出材质模板库"
     bl_description = "将当前材质模板库保存为独立的 .blend 文件，方便拷贝到其它电脑"
-    bl_options = {'REGISTER', 'UNDO'}
 
     filename_ext = ".blend"
     filter_glob: StringProperty(default="*.blend", options={'HIDDEN'})
@@ -601,7 +599,6 @@ class MATERIAL_OT_ImportTemplateLibrary(Operator, ImportHelper):
     bl_idname = "material.import_template_library"
     bl_label = "导入材质模板库"
     bl_description = "从其它电脑导出的材质库或任意 .blend 文件中导入材质模板"
-    bl_options = {'REGISTER', 'UNDO'}
 
     filename_ext = ".blend"
     filter_glob: StringProperty(default="*.blend", options={'HIDDEN'})
@@ -624,7 +621,6 @@ class MATERIAL_OT_OpenTemplateLibraryFolder(Operator):
     bl_idname = "material.open_template_library_folder"
     bl_label = "打开材质库目录"
     bl_description = "在文件管理器中打开存放材质模板库的插件文件夹"
-    bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
         folder = os.path.dirname(MaterialTemplateManager.get_lib_path())
@@ -839,6 +835,12 @@ class MATERIAL_OT_SyncShaderData(Operator):
     target_material_name: StringProperty(default="")  # 目标材质名称属性
     backup_data = {}  # 类变量存储备份数据
 
+    @staticmethod
+    def _clean_node_name(name):
+        while name.startswith('SYNC_'):
+            name = name[5:]
+        return name
+
     def backup_material(self, material):
         """备份指定材质的链接关系和节点信息，并持久化写入材质自定义属性中"""
         if not material or not material.use_nodes or not material.node_tree:
@@ -851,16 +853,12 @@ class MATERIAL_OT_SyncShaderData(Operator):
         backup = {
             'links': [],
             'use_nodes': material.use_nodes,
-            'original_nodes': [
-                node.name
-                for node in material.node_tree.nodes
-                if not node.get('um_synced_node', False)
-            ]
+            'original_nodes': [node.name for node in material.node_tree.nodes if not node.name.startswith('SYNC_') and not node.get('um_synced_node', False)]
         }
         
         for link in material.node_tree.links:
-            # 仅备份非插件同步节点之间的链接
-            if not link.from_node.get('um_synced_node', False) and not link.to_node.get('um_synced_node', False):
+            # 仅备份非 SYNC 原始节点之间的链接
+            if not link.from_node.name.startswith('SYNC_') and not link.to_node.name.startswith('SYNC_'):
                 backup['links'].append({
                     'from_node': link.from_node.name,
                     'from_socket': link.from_socket.identifier,
@@ -906,6 +904,7 @@ class MATERIAL_OT_SyncShaderData(Operator):
         src_nodes_to_copy = [
             n for n in src_mat.node_tree.nodes 
             if n.type != 'OUTPUT_MATERIAL' 
+            and not n.name.startswith('SYNC_') 
             and not n.get('um_synced_node', False)
         ]
 
@@ -921,31 +920,14 @@ class MATERIAL_OT_SyncShaderData(Operator):
                     target_mat.node_tree = bpy.data.node_groups.new("NodeTree", 'ShaderNodeTree')
 
                 # 找到目标材质的输出节点
-                output_node = next(
-                    (
-                        node
-                        for node in target_mat.node_tree.nodes
-                        if node.type == 'OUTPUT_MATERIAL' and node.is_active_output
-                    ),
-                    None,
-                )
-                if not output_node:
-                    output_node = next((n for n in target_mat.node_tree.nodes if n.type == 'OUTPUT_MATERIAL'), None)
+                output_node = next((n for n in target_mat.node_tree.nodes if n.type == 'OUTPUT_MATERIAL'), None)
                 if not output_node:
                     output_node = target_mat.node_tree.nodes.new('ShaderNodeOutputMaterial')
                     output_node.location = (300, 0)
 
                 # 清理目标材质中残留的任何历史 SYNC_ 节点
-                backup = self.backup_data.get(target_mat.name)
-                if not backup and "um_sync_backup" in target_mat:
-                    try:
-                        backup = json.loads(target_mat["um_sync_backup"])
-                    except (TypeError, ValueError):
-                        backup = None
-                original_names = set((backup or {}).get('original_nodes', []))
                 for node in list(target_mat.node_tree.nodes):
-                    is_legacy_sync = node.name.startswith('SYNC_') and node.name not in original_names
-                    if node.get('um_synced_node', False) or is_legacy_sync:
+                    if node.name.startswith('SYNC_') or node.get('um_synced_node', False) or 'SYNC_' in node.name:
                         if node != output_node:
                             target_mat.node_tree.nodes.remove(node)
 
@@ -958,7 +940,7 @@ class MATERIAL_OT_SyncShaderData(Operator):
                 node_mapping = {}
                 for src_node in src_nodes_to_copy:
                     new_node = target_mat.node_tree.nodes.new(src_node.bl_idname)
-                    base_name = src_node.name
+                    base_name = self._clean_node_name(src_node.name)
                     new_node.name = f"SYNC_{base_name}"
                     new_node['um_synced_node'] = True
                     new_node.location = src_node.location
@@ -986,7 +968,7 @@ class MATERIAL_OT_SyncShaderData(Operator):
                 # 复制节点之间的连线关系
                 for link in src_mat.node_tree.links:
                     if (link.from_node.type == 'OUTPUT_MATERIAL' or link.to_node.type == 'OUTPUT_MATERIAL' or
-                        link.from_node.get('um_synced_node', False) or link.to_node.get('um_synced_node', False)):
+                        link.from_node.name.startswith('SYNC_') or link.to_node.name.startswith('SYNC_')):
                         continue
 
                     from_node = node_mapping.get(link.from_node.name)
@@ -1000,46 +982,22 @@ class MATERIAL_OT_SyncShaderData(Operator):
                             except Exception:
                                 pass
 
-                src_output = next(
-                    (
-                        node
-                        for node in src_mat.node_tree.nodes
-                        if node.type == 'OUTPUT_MATERIAL' and node.is_active_output
-                    ),
-                    None,
-                )
-                if not src_output:
-                    src_output = next((node for node in src_mat.node_tree.nodes if node.type == 'OUTPUT_MATERIAL'), None)
+                # 寻找源材质中连接到输出的节点
+                src_final_node = None
+                for link in src_mat.node_tree.links:
+                    if link.to_node.type == 'OUTPUT_MATERIAL':
+                        src_final_node = link.from_node
+                        break
 
-                output_links_created = 0
-                if src_output:
-                    for link in src_mat.node_tree.links:
-                        if link.to_node != src_output:
-                            continue
-                        target_node = node_mapping.get(link.from_node.name)
-                        if not target_node:
-                            continue
-                        target_socket = next(
-                            (socket for socket in target_node.outputs if socket.identifier == link.from_socket.identifier),
-                            None,
-                        )
-                        output_input = next(
-                            (socket for socket in output_node.inputs if socket.identifier == link.to_socket.identifier),
-                            None,
-                        )
-                        if target_socket and output_input:
-                            target_mat.node_tree.links.new(target_socket, output_input)
-                            output_links_created += 1
+                if not src_final_node and src_nodes_to_copy:
+                    src_final_node = next((n for n in src_nodes_to_copy if n.type == 'BSDF_PRINCIPLED'), src_nodes_to_copy[0])
 
-                if output_links_created == 0 and src_nodes_to_copy:
-                    src_final_node = next(
-                        (node for node in src_nodes_to_copy if node.type == 'BSDF_PRINCIPLED'),
-                        src_nodes_to_copy[0],
-                    )
+                if src_final_node:
                     target_final_node = node_mapping.get(src_final_node.name)
-                    surface_input = output_node.inputs.get('Surface')
-                    if target_final_node and target_final_node.outputs and surface_input:
-                        target_mat.node_tree.links.new(target_final_node.outputs[0], surface_input)
+                    if target_final_node and target_final_node.outputs:
+                        surface_input = output_node.inputs.get('Surface')
+                        if surface_input:
+                            target_mat.node_tree.links.new(target_final_node.outputs[0], surface_input)
 
                 target_mat.node_tree.update_tag()
                 processed += 1
@@ -1074,7 +1032,6 @@ class MATERIAL_OT_RevertShaderData(Operator):
                 data = None
 
         try:
-            orig_names = set((data or {}).get('original_nodes', []))
             output_node = next((n for n in material.node_tree.nodes if n.type == 'OUTPUT_MATERIAL'), None)
             if not output_node:
                 return
@@ -1086,8 +1043,7 @@ class MATERIAL_OT_RevertShaderData(Operator):
 
             # 彻底删除所有以 SYNC_ 开头或标记为 um_synced_node 的节点
             for node in list(material.node_tree.nodes):
-                is_legacy_sync = node.name.startswith('SYNC_') and node.name not in orig_names
-                if node.get('um_synced_node', False) or is_legacy_sync:
+                if node.name.startswith('SYNC_') or node.get('um_synced_node', False) or 'SYNC_' in node.name:
                     material.node_tree.nodes.remove(node)
 
             # 如果有备份数据，精确恢复原始连线
@@ -1105,6 +1061,7 @@ class MATERIAL_OT_RevertShaderData(Operator):
                                 pass
 
                 # 智能清理之前历史遗留的、不在原始备份中且没有任何连线的孤立无用 BSDF 节点
+                orig_names = set(data.get('original_nodes', []))
                 if orig_names:
                     for node in list(material.node_tree.nodes):
                         if node != output_node and node.name not in orig_names:
@@ -1470,7 +1427,6 @@ class MATERIAL_OT_ItemActionsPopup(Operator):
     """材质操作菜单"""
     bl_idname = "material.item_actions_popup"
     bl_label = "材质操作"
-    bl_options = {'REGISTER', 'UNDO'}
     
     mat_name: StringProperty(default="")
     
@@ -1565,7 +1521,6 @@ class MATERIAL_OT_UpdateList(Operator):
     """更新材质列表的Operator"""
     bl_idname = "material.update_list_pro"
     bl_label = "更新材质列表"
-    bl_options = {'REGISTER', 'UNDO'}
     
     def execute(self, context):
         props = context.scene.um_props
@@ -1583,13 +1538,6 @@ class MATERIAL_OT_UpdateList(Operator):
             item.material = mat
             
         return {'FINISHED'}
-
-@persistent
-def reset_material_sync_state(_dummy):
-    MATERIAL_OT_SyncShaderData.backup_data.clear()
-    MATERIAL_OT_ToggleSyncRevert.sync_states.clear()
-    MATERIAL_OT_ToggleSyncRevert.global_sync_state = False
-
 
 # 注册函数
 def register():
@@ -1621,15 +1569,9 @@ def register():
     
     if hasattr(bpy.types, "UI_MT_button_context_menu"):
         bpy.types.UI_MT_button_context_menu.append(draw_template_button_context_menu)
-    if reset_material_sync_state not in bpy.app.handlers.load_post:
-        bpy.app.handlers.load_post.append(reset_material_sync_state)
 
 # 注销函数
 def unregister():
-    if reset_material_sync_state in bpy.app.handlers.load_post:
-        bpy.app.handlers.load_post.remove(reset_material_sync_state)
-    reset_material_sync_state(None)
-
     if hasattr(bpy.types, "UI_MT_button_context_menu"):
         try:
             bpy.types.UI_MT_button_context_menu.remove(draw_template_button_context_menu)
