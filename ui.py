@@ -134,10 +134,11 @@ class VIEW3D_PT_UltimateManager(Panel):
         tools_row.operator("custom.clear_normals", icon='NORMALS_FACE', text="清理法线")
         tools_row.popover(panel="VIEW3D_PT_QuickShadingPopover", text="着色", icon='SHADING_SOLID')
 
-        # 新增第二排建模与选择工具栏 (智能环选、90°旋转)
+        # 新增第二排建模与选择工具栏 (智能环选、90°旋转、圈内选面)
         tools_row2 = layout.row(align=True)
         tools_row2.operator("mesh.smart_loop_select", text="智能环选", icon='MOD_EDGESPLIT')
         tools_row2.operator("view3d.open_rotate_90_menu", text="90°旋转", icon='DRIVER_ROTATIONAL_DIFFERENCE')
+        tools_row2.operator("mesh.select_face_ring_region", text="圈内选面", icon='FACESEL')
 
         # 1. 动态自定义分屏工具栏 (第三排：只放分屏功能按键，右侧保留配置齿轮)
         from .workspace import get_editor_icon

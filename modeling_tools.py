@@ -8,7 +8,7 @@ import bpy_extras
 from collections import OrderedDict
 import traceback
 from bpy.types import Operator, PropertyGroup
-from bpy.props import BoolProperty, StringProperty, PointerProperty, FloatProperty, FloatVectorProperty, EnumProperty
+from bpy.props import BoolProperty, StringProperty, PointerProperty, FloatProperty, FloatVectorProperty, EnumProperty, IntProperty
 
 
 # =========================================================================
@@ -262,6 +262,207 @@ class MESH_OT_SmartLoopSelect(Operator):
         bmesh.update_edit_mesh(mesh)
         context.view_layer.update()
         self.report({'INFO'}, f"智能环选已选中 {len(all_selected_edges)} 条边")
+        return {'FINISHED'}
+
+
+# =========================================================================
+# 面圈区域选择：首次选择较小侧，再次执行切换另一侧
+# =========================================================================
+class FaceRingRegionState(PropertyGroup):
+    object_name: StringProperty(options={'SKIP_SAVE'})
+    mesh_name: StringProperty(options={'SKIP_SAVE'})
+    face_count: IntProperty(options={'SKIP_SAVE'})
+    edge_count: IntProperty(options={'SKIP_SAVE'})
+    vertex_count: IntProperty(options={'SKIP_SAVE'})
+    ring_faces: StringProperty(options={'SKIP_SAVE'})
+    small_side_faces: StringProperty(options={'SKIP_SAVE'})
+    large_side_faces: StringProperty(options={'SKIP_SAVE'})
+
+    def reset(self):
+        self.object_name = ""
+        self.mesh_name = ""
+        self.face_count = 0
+        self.edge_count = 0
+        self.vertex_count = 0
+        self.ring_faces = ""
+        self.small_side_faces = ""
+        self.large_side_faces = ""
+
+
+def _face_component(start_face, blocked_faces):
+    component = set()
+    pending = [start_face]
+
+    while pending:
+        face = pending.pop()
+        if face in component or face in blocked_faces:
+            continue
+        component.add(face)
+        for edge in face.edges:
+            for linked_face in edge.link_faces:
+                if linked_face not in component and linked_face not in blocked_faces:
+                    pending.append(linked_face)
+
+    return component
+
+
+def _world_face_area(face, matrix_world):
+    coordinates = [matrix_world @ loop.vert.co for loop in face.loops]
+    triangles = mathutils.geometry.tessellate_polygon([coordinates])
+    area = 0.0
+    for triangle in triangles:
+        points = [coordinates[index] for index in triangle] if isinstance(triangle[0], int) else triangle
+        area += (points[1] - points[0]).cross(points[2] - points[0]).length * 0.5
+    return area
+
+
+class MESH_OT_SelectFaceRingRegion(Operator):
+    bl_idname = "mesh.select_face_ring_region"
+    bl_label = "圈内选面"
+    bl_description = "选择面圈两侧中面积较小的一侧；再次执行可切换到另一侧（支持右键分配快捷键）"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return (
+            context.mode == 'EDIT_MESH'
+            and context.active_object
+            and context.active_object.type == 'MESH'
+        )
+
+    @staticmethod
+    def _decode_indices(value):
+        try:
+            return set(json.loads(value))
+        except (json.JSONDecodeError, TypeError):
+            return set()
+
+    @staticmethod
+    def _apply_selection(bm, selected_indices):
+        for face in bm.faces:
+            face.select = False
+        for edge in bm.edges:
+            edge.select = False
+        for vertex in bm.verts:
+            vertex.select = False
+
+        for face_index in selected_indices:
+            bm.faces[face_index].select_set(True)
+        bm.select_flush_mode()
+
+    def _try_toggle_stored_region(self, obj, bm, state):
+        if (
+            state.object_name != obj.name
+            or state.mesh_name != obj.data.name
+            or state.face_count != len(bm.faces)
+            or state.edge_count != len(bm.edges)
+            or state.vertex_count != len(bm.verts)
+        ):
+            state.reset()
+            return False
+
+        ring_indices = self._decode_indices(state.ring_faces)
+        small_indices = self._decode_indices(state.small_side_faces)
+        large_indices = self._decode_indices(state.large_side_faces)
+        all_indices = ring_indices | small_indices | large_indices
+        if not ring_indices or not small_indices or not large_indices or any(
+            index < 0 or index >= len(bm.faces) for index in all_indices
+        ):
+            state.reset()
+            return False
+
+        current_indices = {face.index for face in bm.faces if face.select}
+        small_selection = ring_indices | small_indices
+        large_selection = ring_indices | large_indices
+
+        if current_indices == small_selection:
+            target_indices = large_selection
+            side_name = "较大侧"
+        elif current_indices == large_selection:
+            target_indices = small_selection
+            side_name = "较小侧"
+        else:
+            state.reset()
+            return False
+
+        self._apply_selection(bm, target_indices)
+        bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+        self.report({'INFO'}, f"已切换到面圈{side_name}（{len(target_indices) - len(ring_indices)} 个面）")
+        return True
+
+    def execute(self, context):
+        if tuple(context.tool_settings.mesh_select_mode) != (False, False, True):
+            return {'PASS_THROUGH'}
+
+        obj = context.active_object
+        bm = bmesh.from_edit_mesh(obj.data)
+        bm.verts.ensure_lookup_table()
+        bm.edges.ensure_lookup_table()
+        bm.faces.ensure_lookup_table()
+        bm.faces.index_update()
+
+        state = context.scene.face_ring_region_state
+        if self._try_toggle_stored_region(obj, bm, state):
+            return {'FINISHED'}
+
+        ring_faces = {face for face in bm.faces if face.select}
+        if not ring_faces:
+            return {'PASS_THROUGH'}
+
+        connected_ring = _face_component(next(iter(ring_faces)), set(bm.faces) - ring_faces)
+        if connected_ring != ring_faces:
+            self.report({'WARNING'}, "请选择一圈连续的面")
+            return {'PASS_THROUGH'}
+
+        adjacent_unselected = {
+            linked_face
+            for face in ring_faces
+            for edge in face.edges
+            for linked_face in edge.link_faces
+            if linked_face not in ring_faces
+        }
+
+        side_components = []
+        remaining_seeds = set(adjacent_unselected)
+        while remaining_seeds:
+            component = _face_component(remaining_seeds.pop(), ring_faces)
+            side_components.append(component)
+            remaining_seeds.difference_update(component)
+
+        if len(side_components) != 2 or any(not component for component in side_components):
+            self.report({'WARNING'}, "所选面没有形成可分割两侧的封闭面圈")
+            return {'PASS_THROUGH'}
+
+        side_areas = [
+            sum(_world_face_area(face, obj.matrix_world) for face in component)
+            for component in side_components
+        ]
+        area_tolerance = max(1e-6, max(side_areas) * 1e-6)
+        if abs(side_areas[0] - side_areas[1]) < area_tolerance:
+            self.report({'WARNING'}, "面圈两侧面积相同，无法确定较小侧")
+            return {'PASS_THROUGH'}
+
+        if side_areas[0] < side_areas[1]:
+            small_side, large_side = side_components
+        else:
+            large_side, small_side = side_components
+
+        ring_indices = {face.index for face in ring_faces}
+        small_indices = {face.index for face in small_side}
+        large_indices = {face.index for face in large_side}
+
+        state.object_name = obj.name
+        state.mesh_name = obj.data.name
+        state.face_count = len(bm.faces)
+        state.edge_count = len(bm.edges)
+        state.vertex_count = len(bm.verts)
+        state.ring_faces = json.dumps(sorted(ring_indices))
+        state.small_side_faces = json.dumps(sorted(small_indices))
+        state.large_side_faces = json.dumps(sorted(large_indices))
+
+        self._apply_selection(bm, ring_indices | small_indices)
+        bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+        self.report({'INFO'}, f"已选择面圈较小侧（{len(small_indices)} 个面）")
         return {'FINISHED'}
 
 
@@ -898,12 +1099,14 @@ class VIEW3D_OT_OpenRotate90Menu(Operator):
 
 
 classes = (
+    FaceRingRegionState,
     OutlinerState,
     FLATTEN_FACE_OT_operator,
     HOLE_FILL_OT_operator,
     MATERIAL_OT_UltraCombine,
     OUTLINER_OT_ToggleOperator,
     MESH_OT_SmartLoopSelect,
+    MESH_OT_SelectFaceRingRegion,
     OBJECT_OT_Rotate90Degrees,
     PIE_MT_Rotate90Pie,
     VIEW3D_OT_OpenRotate90Menu,
@@ -929,8 +1132,11 @@ def register():
     for cls in classes:
         safe_register_class(cls)
     bpy.types.Scene.outliner_state = PointerProperty(type=OutlinerState)
+    bpy.types.Scene.face_ring_region_state = PointerProperty(type=FaceRingRegionState)
 
 def unregister():
+    if hasattr(bpy.types.Scene, 'face_ring_region_state'):
+        del bpy.types.Scene.face_ring_region_state
     if hasattr(bpy.types.Scene, 'outliner_state'):
         del bpy.types.Scene.outliner_state
     for cls in reversed(classes):
