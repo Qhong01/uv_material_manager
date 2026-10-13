@@ -1128,13 +1128,47 @@ def safe_unregister_class(cls):
     except Exception:
         pass
 
+
+def unregister_face_ring_keymap():
+    window_manager = getattr(bpy.context, 'window_manager', None)
+    keyconfig = window_manager.keyconfigs.addon if window_manager else None
+    if not keyconfig:
+        return
+
+    keymap = keyconfig.keymaps.get('Mesh')
+    if not keymap:
+        return
+
+    for keymap_item in list(keymap.keymap_items):
+        if keymap_item.idname == MESH_OT_SelectFaceRingRegion.bl_idname:
+            keymap.keymap_items.remove(keymap_item)
+
+
+def register_face_ring_keymap():
+    window_manager = getattr(bpy.context, 'window_manager', None)
+    keyconfig = window_manager.keyconfigs.addon if window_manager else None
+    if not keyconfig:
+        return
+
+    unregister_face_ring_keymap()
+    keymap = keyconfig.keymaps.new(name='Mesh', space_type='EMPTY', region_type='WINDOW')
+    keymap.keymap_items.new(
+        MESH_OT_SelectFaceRingRegion.bl_idname,
+        type='THREE',
+        value='PRESS',
+        head=True,
+    )
+
+
 def register():
     for cls in classes:
         safe_register_class(cls)
     bpy.types.Scene.outliner_state = PointerProperty(type=OutlinerState)
     bpy.types.Scene.face_ring_region_state = PointerProperty(type=FaceRingRegionState)
+    register_face_ring_keymap()
 
 def unregister():
+    unregister_face_ring_keymap()
     if hasattr(bpy.types.Scene, 'face_ring_region_state'):
         del bpy.types.Scene.face_ring_region_state
     if hasattr(bpy.types.Scene, 'outliner_state'):
