@@ -483,11 +483,43 @@ def sync_uv_layers(src_obj):
                 dst_layers.active_index = min(src_active_idx, len(dst_layers)-1)
 
 
+def get_uv_layer_mismatches(context):
+    """Return UV layer indices whose presence or names differ across selected meshes."""
+    selected_objects = [
+        obj for obj in context.selected_objects
+        if obj.type == 'MESH'
+    ]
+    if len(selected_objects) < 2:
+        return {}
+
+    max_layer_count = max(len(obj.data.uv_layers) for obj in selected_objects)
+    mismatches = {}
+
+    for index in range(max_layer_count):
+        names = [
+            obj.data.uv_layers[index].name
+            for obj in selected_objects
+            if index < len(obj.data.uv_layers)
+        ]
+        has_missing_layer = len(names) != len(selected_objects)
+        has_different_names = len(set(names)) > 1
+
+        if has_missing_layer and has_different_names:
+            mismatches[index] = "部分物体缺失且名称不同"
+        elif has_missing_layer:
+            mismatches[index] = "部分物体缺失"
+        elif has_different_names:
+            mismatches[index] = "名称不同"
+
+    return mismatches
+
+
 class UV_UL_LayersList(UIList):
     bl_idname = "UV_UL_LayersListPro"
 
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
         row = layout.row(align=True)
+        row.alert = index in get_uv_layer_mismatches(context)
         is_active = (index == active_data.active_index)
 
         # 单选状态指示与切换

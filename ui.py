@@ -3,6 +3,19 @@ import bmesh
 from bpy.types import Operator, Panel
 from bpy.props import FloatProperty
 from .modifier_manager import draw_modifiers_section
+from .uv_manager import get_uv_layer_mismatches
+
+
+def draw_uv_layer_mismatch_warning(layout, context):
+    mismatches = get_uv_layer_mismatches(context)
+    if not mismatches:
+        return
+
+    warning_box = layout.box()
+    warning_box.alert = True
+    warning_box.label(text="选中物体的 UV 层不一致", icon='ERROR')
+    for index, reason in mismatches.items():
+        warning_box.label(text=f"第 {index + 1} 层：{reason}")
 
 # 清除法线功能
 class CUSTOM_OT_ClearNormals(Operator):
@@ -218,6 +231,8 @@ class VIEW3D_PT_UltimateManager(Panel):
             rows=3
         )
 
+        draw_uv_layer_mismatch_warning(layout, context)
+
         self.draw_uv_stats(layout, context)
 
     def draw_uv_stats(self, layout, context):
@@ -354,6 +369,8 @@ class VIEW3D_PT_UVLayerManager(Panel):
                 obj.data.uv_layers, "active_index",
                 rows=2
             )
+
+            draw_uv_layer_mismatch_warning(list_box, context)
             
             # 底部复制粘贴操作栏
             button_row = list_box.row(align=True)
