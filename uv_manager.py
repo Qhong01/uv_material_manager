@@ -539,8 +539,6 @@ class UV_UL_LayersList(UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
         row = layout.row(align=True)
         mismatch_reason = get_uv_layer_mismatches(context).get(index)
-        row.alert = mismatch_reason is not None
-        row.active = mismatch_reason is None
 
         active_obj = context.object
         active_layers = active_obj.data.uv_layers if active_obj and active_obj.type == 'MESH' else None
@@ -548,37 +546,19 @@ class UV_UL_LayersList(UIList):
         is_active = active_item is not None and index == active_data.active_index
 
         if active_item is None:
-            op = row.operator(
-                "uv.set_active_layer_direct",
-                text="",
-                icon='RADIOBUT_OFF',
-                emboss=True
-            )
-            op.layer_index = index
-
+            row.label(text="", icon='RADIOBUT_OFF')
             split = row.split(factor=0.58, align=True)
-            op = split.operator(
-                "uv.set_active_layer_direct",
-                text=f"第 {index + 1} 层",
-                emboss=True
-            )
-            op.layer_index = index
+            split.label(text=f"第 {index + 1} 层")
 
             status_row = split.row(align=True)
+            status_row.alert = True
             op = status_row.operator(
                 "uv.set_active_layer_direct",
                 text="部分缺失",
                 emboss=True
             )
             op.layer_index = index
-
-            op = row.operator(
-                "uv.set_active_layer_direct",
-                text="",
-                icon='BLANK1',
-                emboss=True
-            )
-            op.layer_index = index
+            row.label(text="", icon='BLANK1')
             return
 
         # 单选状态指示与切换
@@ -586,15 +566,16 @@ class UV_UL_LayersList(UIList):
             "uv.set_active_layer_direct",
             text="",
             icon='RADIOBUT_ON' if is_active else 'RADIOBUT_OFF',
-            emboss=bool(mismatch_reason)
+            emboss=False
         )
         op.layer_index = index
 
         if mismatch_reason:
             split = row.split(factor=0.58, align=True)
-            split.prop(active_item, "name", text="", emboss=True)
+            split.prop(active_item, "name", text="", emboss=False)
 
             status_row = split.row(align=True)
+            status_row.alert = True
             short_reason = {
                 "部分物体缺失": "部分缺失",
                 "部分物体缺失且名称不同": "缺失且异名",
@@ -615,7 +596,7 @@ class UV_UL_LayersList(UIList):
             "active_render",
             text="",
             icon=render_icon,
-            emboss=bool(mismatch_reason)
+            emboss=False
         )
 
 
