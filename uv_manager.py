@@ -547,15 +547,37 @@ class UV_UL_LayersList(UIList):
         is_active = active_item is not None and index == active_data.active_index
 
         if active_item is None:
-            row.label(text="", icon='RADIOBUT_OFF')
+            op = row.operator(
+                "uv.set_active_layer_direct",
+                text="",
+                icon='RADIOBUT_OFF',
+                emboss=True
+            )
+            op.layer_index = index
+
             split = row.split(factor=0.58, align=True)
-            split.label(text=f"第 {index + 1} 层")
+            op = split.operator(
+                "uv.set_active_layer_direct",
+                text=f"第 {index + 1} 层",
+                emboss=True
+            )
+            op.layer_index = index
 
             status_row = split.row(align=True)
-            status_row.active = False
-            status_row.alignment = 'RIGHT'
-            status_row.label(text="部分缺失")
-            row.label(text="", icon='BLANK1')
+            op = status_row.operator(
+                "uv.set_active_layer_direct",
+                text="部分缺失",
+                emboss=True
+            )
+            op.layer_index = index
+
+            op = row.operator(
+                "uv.set_active_layer_direct",
+                text="",
+                icon='BLANK1',
+                emboss=True
+            )
+            op.layer_index = index
             return
 
         # 单选状态指示与切换
@@ -563,28 +585,37 @@ class UV_UL_LayersList(UIList):
             "uv.set_active_layer_direct",
             text="",
             icon='RADIOBUT_ON' if is_active else 'RADIOBUT_OFF',
-            emboss=False
+            emboss=bool(mismatch_reason)
         )
         op.layer_index = index
 
         if mismatch_reason:
             split = row.split(factor=0.58, align=True)
-            split.prop(active_item, "name", text="", emboss=False)
+            split.prop(active_item, "name", text="", emboss=True)
 
             status_row = split.row(align=True)
-            status_row.active = False
-            status_row.alignment = 'RIGHT'
             short_reason = {
                 "部分物体缺失": "部分缺失",
                 "部分物体缺失且名称不同": "缺失且异名",
             }.get(mismatch_reason, mismatch_reason)
-            status_row.label(text=short_reason)
+            op = status_row.operator(
+                "uv.set_active_layer_direct",
+                text=short_reason,
+                emboss=True
+            )
+            op.layer_index = index
         else:
             row.prop(active_item, "name", text="", emboss=False)
 
         # 渲染层相机图标
         render_icon = 'RESTRICT_RENDER_OFF' if active_item.active_render else 'RESTRICT_RENDER_ON'
-        row.prop(active_item, "active_render", text="", icon=render_icon, emboss=False)
+        row.prop(
+            active_item,
+            "active_render",
+            text="",
+            icon=render_icon,
+            emboss=bool(mismatch_reason)
+        )
 
 
 # =========================================================================
