@@ -1,6 +1,7 @@
 import bpy
-from bpy.types import Operator, Menu
-from bpy.props import StringProperty, BoolProperty
+import json
+from bpy.types import Operator, Menu, PropertyGroup
+from bpy.props import StringProperty, BoolProperty, PointerProperty, CollectionProperty
 from bpy.app.handlers import persistent
 from . import modifier_layouts
 
@@ -72,10 +73,28 @@ def get_modifier_icon(mod_type):
 # 实时自动同步引擎 (仅在修改参数时同步，切换选中时不触发)
 # =========================================================================
 
+class ModifierSyncSnapshot(PropertyGroup):
+    object_name: StringProperty()
+    modifier_name: StringProperty()
+    data: StringProperty()
+
+
+class ModifierSyncRuntimeState(PropertyGroup):
+    snapshots: CollectionProperty(type=ModifierSyncSnapshot)
+    selection_signature: StringProperty()
+    is_syncing: BoolProperty(default=False)
+    warning_message: StringProperty()
+
+
 class ModifierAutoSync:
-    _snapshots = {}
-    _is_syncing = False
-    _last_selection = ()
+    ALWAYS_IGNORED_PROPERTIES = {
+        'name', 'type', 'show_expanded', 'is_active', 'execution_time',
+        'is_override_data'
+    }
+    IGNORED_PROPERTIES = {
+        'show_viewport', 'show_render', 'show_in_editmode', 'show_on_cage',
+        'use_pin_to_last'
+    }
 
     @classmethod
     def serialize_value(cls, val):
@@ -87,19 +106,18 @@ class ModifierAutoSync:
             return getattr(val, 'name', str(val))
         try:
             if not isinstance(val, (str, bytes)):
-                return tuple(cls.serialize_value(x) for x in val)
+                return [cls.serialize_value(x) for x in val]
         except TypeError:
             pass
         return str(val)
 
     @classmethod
-    def get_snapshot(cls, mod):
+    def get_snapshot(cls, mod, include_display=False):
         snap = {}
-        ignored = {
-            'name', 'type', 'show_expanded', 'is_active',
-            'execution_time', 'is_override_data'
-        }
         for p in mod.bl_rna.properties:
+            ignored = cls.ALWAYS_IGNORED_PROPERTIES
+            if not include_display:
+                ignored = ignored | cls.IGNORED_PROPERTIES
             if not p.is_readonly and p.identifier not in ignored:
                 try:
                     val = getattr(mod, p.identifier)
@@ -109,20 +127,71 @@ class ModifierAutoSync:
         return snap
 
     @classmethod
-    def ensure_snapshots(cls, objects):
-        """确保当前选中的所有物体及其修改器在快照池中都有基准记录"""
+    def get_state(cls, scene):
+        return getattr(scene, "um_modifier_sync_state", None)
+
+    @classmethod
+    def find_snapshot(cls, scene, obj, mod):
+        state = cls.get_state(scene)
+        if not state:
+            return None
+        return next((entry for entry in state.snapshots
+                     if entry.object_name == obj.name and entry.modifier_name == mod.name), None)
+
+    @classmethod
+    def set_snapshot(cls, scene, obj, mod, snapshot=None):
+        state = cls.get_state(scene)
+        if not state:
+            return
+        entry = cls.find_snapshot(scene, obj, mod)
+        if entry is None:
+            entry = state.snapshots.add()
+            entry.object_name = obj.name
+            entry.modifier_name = mod.name
+        entry.data = json.dumps(snapshot if snapshot is not None else cls.get_snapshot(mod), sort_keys=True)
+
+    @classmethod
+    def remove_snapshot(cls, scene, obj, modifier_name):
+        state = cls.get_state(scene)
+        if not state:
+            return
+        for index in range(len(state.snapshots) - 1, -1, -1):
+            entry = state.snapshots[index]
+            if entry.object_name == obj.name and entry.modifier_name == modifier_name:
+                state.snapshots.remove(index)
+
+    @classmethod
+    def ensure_snapshots(cls, scene, objects):
+        """Rebuild the baseline for the selected meshes and their modifiers."""
+        state = cls.get_state(scene)
+        if not state:
+            return
+        state.snapshots.clear()
         for obj in objects:
             if obj and obj.type == 'MESH':
                 for mod in obj.modifiers:
-                    key = (obj.name, mod.name)
-                    cls._snapshots[key] = cls.get_snapshot(mod)
+                    cls.set_snapshot(scene, obj, mod)
+
+    @classmethod
+    def reset_all_states(cls, *_args):
+        for scene in bpy.data.scenes:
+            state = cls.get_state(scene)
+            if state:
+                state.snapshots.clear()
+                state.selection_signature = ""
+                state.is_syncing = False
+                state.warning_message = ""
 
     @classmethod
     def update_handler(cls, scene, depsgraph):
-        if cls._is_syncing:
+        state = cls.get_state(scene)
+        if not state or state.is_syncing:
             return
 
         if hasattr(scene, "um_auto_sync_modifiers") and not scene.um_auto_sync_modifiers:
+            state.snapshots.clear()
+            state.selection_signature = ""
+            state.warning_message = ""
             return
 
         context = bpy.context
@@ -135,25 +204,40 @@ class ModifierAutoSync:
             return
 
         curr_selection = (active_obj.name, tuple(sorted(o.name for o in selected_objs)))
+        curr_selection_signature = json.dumps(curr_selection)
 
         # 如果用户刚在视图中切换了选择，仅更新基准快照，绝不触发参数同步
-        if curr_selection != cls._last_selection:
-            cls._last_selection = curr_selection
-            cls.ensure_snapshots(selected_objs)
+        if curr_selection_signature != state.selection_signature:
+            state.selection_signature = curr_selection_signature
+            state.warning_message = ""
+            cls.ensure_snapshots(scene, selected_objs)
+            return
+
+        # 只在活动物体或其网格数据确实发生几何更新时检查修改器参数。
+        updated_geometry_ids = set()
+        for update in depsgraph.updates:
+            if not update.is_updated_geometry:
+                continue
+            original_id = getattr(update.id, "original", None)
+            if original_id is not None:
+                updated_geometry_ids.add(original_id.as_pointer())
+        if (active_obj.as_pointer() not in updated_geometry_ids
+                and active_obj.data.as_pointer() not in updated_geometry_ids):
             return
 
         other_selected = [o for o in selected_objs if o != active_obj]
         if not other_selected:
             for mod in active_obj.modifiers:
-                cls._snapshots[(active_obj.name, mod.name)] = cls.get_snapshot(mod)
+                cls.set_snapshot(scene, active_obj, mod)
             return
 
-        cls._is_syncing = True
+        state.is_syncing = True
         try:
+            state.warning_message = ""
             for mod in active_obj.modifiers:
-                key = (active_obj.name, mod.name)
                 curr_snap = cls.get_snapshot(mod)
-                prev_snap = cls._snapshots.get(key)
+                snapshot_entry = cls.find_snapshot(scene, active_obj, mod)
+                prev_snap = json.loads(snapshot_entry.data) if snapshot_entry and snapshot_entry.data else None
 
                 changed_props = []
                 if prev_snap is not None:
@@ -162,36 +246,41 @@ class ModifierAutoSync:
                             changed_props.append((prop_id, curr_val))
 
                 if changed_props:
+                    skipped_targets = []
                     for prop_id, curr_val in changed_props:
                         raw_val = getattr(mod, prop_id)
                         for target_obj in other_selected:
                             target_mod = target_obj.modifiers.get(mod.name)
-                            if not target_mod:
-                                for m in target_obj.modifiers:
-                                    if m.type == mod.type:
-                                        target_mod = m
-                                        break
-                            if target_mod and hasattr(target_mod, prop_id):
+                            if (target_mod and target_mod.type == mod.type
+                                    and hasattr(target_mod, prop_id)):
                                 try:
-                                    if isinstance(curr_val, tuple):
+                                    if isinstance(curr_val, (tuple, list)):
                                         setattr(target_mod, prop_id, list(raw_val))
                                     else:
                                         setattr(target_mod, prop_id, raw_val)
-                                    target_key = (target_obj.name, target_mod.name)
-                                    if target_key in cls._snapshots:
-                                        cls._snapshots[target_key][prop_id] = curr_val
-                                    else:
-                                        cls._snapshots[target_key] = cls.get_snapshot(target_mod)
+                                    cls.set_snapshot(scene, target_obj, target_mod)
                                 except Exception:
                                     pass
-                cls._snapshots[key] = curr_snap
+                            elif target_obj.name not in skipped_targets:
+                                skipped_targets.append(target_obj.name)
+                    if skipped_targets:
+                        state.warning_message = (
+                            f"未同步 {mod.name}：以下物体缺少同名且同类型的修改器："
+                            + ", ".join(skipped_targets[:3])
+                        )
+                cls.set_snapshot(scene, active_obj, mod, curr_snap)
         finally:
-            cls._is_syncing = False
+            state.is_syncing = False
 
 
 @persistent
 def depsgraph_update_handler(scene, depsgraph):
     ModifierAutoSync.update_handler(scene, depsgraph)
+
+
+@persistent
+def modifier_sync_reset_handler(*args):
+    ModifierAutoSync.reset_all_states(*args)
 
 
 # =========================================================================
@@ -274,7 +363,7 @@ class MODIFIER_OT_AddCustom(Operator):
                     name=self.modifier_type.capitalize().replace('_', ' '),
                     type=self.modifier_type
                 )
-                ModifierAutoSync._snapshots[(obj.name, mod.name)] = ModifierAutoSync.get_snapshot(mod)
+                ModifierAutoSync.set_snapshot(context.scene, obj, mod)
                 added_count += 1
             except Exception as e:
                 self.report({'WARNING'}, f"在物体 {obj.name} 上添加修改器失败: {str(e)}")
@@ -307,7 +396,7 @@ class MODIFIER_OT_ApplyToAll(Operator):
             try:
                 context.view_layer.objects.active = obj
                 bpy.ops.object.modifier_apply(modifier=mod.name)
-                ModifierAutoSync._snapshots.pop((obj.name, mod.name), None)
+                ModifierAutoSync.remove_snapshot(context.scene, obj, mod.name)
                 processed += 1
             except Exception as e:
                 errors.append(f"{obj.name}: {str(e)}")
@@ -335,7 +424,7 @@ class MODIFIER_OT_RemoveFromSelected(Operator):
             if obj.type != 'MESH':
                 continue
             if mod := obj.modifiers.get(self.modifier_name):
-                ModifierAutoSync._snapshots.pop((obj.name, mod.name), None)
+                ModifierAutoSync.remove_snapshot(context.scene, obj, mod.name)
                 obj.modifiers.remove(mod)
                 processed += 1
 
@@ -359,7 +448,7 @@ class MODIFIER_OT_SyncToSelected(Operator):
             return {'CANCELLED'}
 
         src_mod = active_obj.modifiers[self.modifier_name]
-        curr_snap = ModifierAutoSync.get_snapshot(src_mod)
+        curr_snap = ModifierAutoSync.get_snapshot(src_mod, include_display=True)
         selected_objs = [o for o in context.selected_objects if o.type == 'MESH' and o != active_obj]
 
         if not selected_objs:
@@ -385,13 +474,13 @@ class MODIFIER_OT_SyncToSelected(Operator):
                     if hasattr(target_mod, prop_id):
                         try:
                             raw_val = getattr(src_mod, prop_id)
-                            if isinstance(curr_val, tuple):
+                            if isinstance(curr_val, (tuple, list)):
                                 setattr(target_mod, prop_id, list(raw_val))
                             else:
                                 setattr(target_mod, prop_id, raw_val)
                         except Exception:
                             pass
-                ModifierAutoSync._snapshots[(target_obj.name, target_mod.name)] = ModifierAutoSync.get_snapshot(target_mod)
+                ModifierAutoSync.set_snapshot(context.scene, target_obj, target_mod)
                 synced_count += 1
 
         self.report({'INFO'}, f"✨ 已成功将修改器 '{src_mod.name}' 同步到 {synced_count} 个物体")
@@ -1134,6 +1223,12 @@ def draw_modifiers_section(layout, context):
 
     selected_count = len(selected_objs)
 
+    sync_state = ModifierAutoSync.get_state(context.scene)
+    if sync_state and sync_state.warning_message:
+        warning_row = layout.row()
+        warning_row.alert = True
+        warning_row.label(text=sync_state.warning_message, icon='ERROR')
+
     # 1. 聚合所有选中物体的修改器（去重有序收集）
     unique_mod_dict = {}  # key: mod_name -> { 'type': ..., 'instance': ..., 'owner': ..., 'count': ... }
     
@@ -1236,6 +1331,13 @@ classes = (
 )
 
 def register():
+    bpy.utils.register_class(ModifierSyncSnapshot)
+    bpy.utils.register_class(ModifierSyncRuntimeState)
+
+    bpy.types.Scene.um_modifier_sync_state = PointerProperty(
+        type=ModifierSyncRuntimeState,
+        options={'SKIP_SAVE'}
+    )
     bpy.types.Scene.um_auto_sync_modifiers = BoolProperty(
         name="自动同步修改器参数",
         description="修改活动物体修改器的某项参数时，自动同步该项参数到所有选中的物体",
@@ -1247,13 +1349,25 @@ def register():
 
     if depsgraph_update_handler not in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.append(depsgraph_update_handler)
+    for handler_list in (bpy.app.handlers.load_post, bpy.app.handlers.undo_post, bpy.app.handlers.redo_post):
+        if modifier_sync_reset_handler not in handler_list:
+            handler_list.append(modifier_sync_reset_handler)
+    ModifierAutoSync.reset_all_states()
 
 def unregister():
     if depsgraph_update_handler in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.remove(depsgraph_update_handler)
+    for handler_list in (bpy.app.handlers.load_post, bpy.app.handlers.undo_post, bpy.app.handlers.redo_post):
+        if modifier_sync_reset_handler in handler_list:
+            handler_list.remove(modifier_sync_reset_handler)
 
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
 
     if hasattr(bpy.types.Scene, "um_auto_sync_modifiers"):
         del bpy.types.Scene.um_auto_sync_modifiers
+    if hasattr(bpy.types.Scene, "um_modifier_sync_state"):
+        del bpy.types.Scene.um_modifier_sync_state
+
+    bpy.utils.unregister_class(ModifierSyncRuntimeState)
+    bpy.utils.unregister_class(ModifierSyncSnapshot)
