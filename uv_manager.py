@@ -540,6 +540,7 @@ class UV_UL_LayersList(UIList):
         row = layout.row(align=True)
         mismatch_reason = get_uv_layer_mismatches(context).get(index)
         row.alert = mismatch_reason is not None
+        row.active = mismatch_reason is None
 
         active_obj = context.object
         active_layers = active_obj.data.uv_layers if active_obj and active_obj.type == 'MESH' else None
