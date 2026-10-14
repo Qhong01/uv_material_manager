@@ -3,19 +3,7 @@ import bmesh
 from bpy.types import Operator, Panel
 from bpy.props import FloatProperty
 from .modifier_manager import draw_modifiers_section
-from .uv_manager import get_uv_layer_mismatches
-
-
-def draw_missing_uv_layer_rows(layout, context, obj):
-    mismatches = get_uv_layer_mismatches(context)
-    for index, reason in mismatches.items():
-        if index < len(obj.data.uv_layers):
-            continue
-
-        row = layout.row(align=True)
-        row.active = False
-        row.label(text=f"第 {index + 1} 层", icon='ERROR')
-        row.label(text=reason)
+from .uv_manager import get_uv_layer_list_source
 
 # 清除法线功能
 class CUSTOM_OT_ClearNormals(Operator):
@@ -223,15 +211,14 @@ class VIEW3D_PT_UltimateManager(Panel):
         grid.operator("uv.sync_layers_pro", text="同步", icon='UV_SYNC_SELECT')
         grid.operator("uv.select_max_layers_pro", text="最大层", icon='SELECT_EXTEND')
 
+        list_source = get_uv_layer_list_source(context, obj)
         layout.template_list(
             "UV_UL_LayersListPro",
             "",
-            obj.data, "uv_layers",
+            list_source.data, "uv_layers",
             obj.data.uv_layers, "active_index",
             rows=3
         )
-
-        draw_missing_uv_layer_rows(layout, context, obj)
 
         self.draw_uv_stats(layout, context)
 
@@ -362,15 +349,14 @@ class VIEW3D_PT_UVLayerManager(Panel):
         # UV层列表
         list_box = main_box.box()
         if obj and obj.type == 'MESH':
+            list_source = get_uv_layer_list_source(context, obj)
             list_box.template_list(
                 "UV_UL_LayersListPro",
                 "",
-                obj.data, "uv_layers",
+                list_source.data, "uv_layers",
                 obj.data.uv_layers, "active_index",
                 rows=2
             )
-
-            draw_missing_uv_layer_rows(list_box, context, obj)
             
             # 底部复制粘贴操作栏
             button_row = list_box.row(align=True)

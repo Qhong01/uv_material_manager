@@ -514,13 +514,49 @@ def get_uv_layer_mismatches(context):
     return mismatches
 
 
+def get_uv_layer_list_source(context, active_obj):
+    """Use a selected mesh with the most UV layers to expose missing rows in the UI list."""
+    selected_objects = [
+        obj for obj in context.selected_objects
+        if obj.type == 'MESH'
+    ]
+    if not selected_objects:
+        return active_obj
+
+    max_layer_count = max(len(obj.data.uv_layers) for obj in selected_objects)
+    if active_obj in selected_objects and len(active_obj.data.uv_layers) == max_layer_count:
+        return active_obj
+
+    return next(
+        obj for obj in selected_objects
+        if len(obj.data.uv_layers) == max_layer_count
+    )
+
+
 class UV_UL_LayersList(UIList):
     bl_idname = "UV_UL_LayersListPro"
 
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
         row = layout.row(align=True)
         mismatch_reason = get_uv_layer_mismatches(context).get(index)
-        is_active = (index == active_data.active_index)
+        row.alert = mismatch_reason is not None
+
+        active_obj = context.object
+        active_layers = active_obj.data.uv_layers if active_obj and active_obj.type == 'MESH' else None
+        active_item = active_layers[index] if active_layers and index < len(active_layers) else None
+        is_active = active_item is not None and index == active_data.active_index
+
+        if active_item is None:
+            row.label(text="", icon='RADIOBUT_OFF')
+            split = row.split(factor=0.58, align=True)
+            split.label(text=f"第 {index + 1} 层")
+
+            status_row = split.row(align=True)
+            status_row.active = False
+            status_row.alignment = 'RIGHT'
+            status_row.label(text="部分缺失")
+            row.label(text="", icon='BLANK1')
+            return
 
         # 单选状态指示与切换
         op = row.operator(
@@ -533,7 +569,7 @@ class UV_UL_LayersList(UIList):
 
         if mismatch_reason:
             split = row.split(factor=0.58, align=True)
-            split.prop(item, "name", text="", emboss=False)
+            split.prop(active_item, "name", text="", emboss=False)
 
             status_row = split.row(align=True)
             status_row.active = False
@@ -544,11 +580,11 @@ class UV_UL_LayersList(UIList):
             }.get(mismatch_reason, mismatch_reason)
             status_row.label(text=short_reason)
         else:
-            row.prop(item, "name", text="", emboss=False)
+            row.prop(active_item, "name", text="", emboss=False)
 
         # 渲染层相机图标
-        render_icon = 'RESTRICT_RENDER_OFF' if item.active_render else 'RESTRICT_RENDER_ON'
-        row.prop(item, "active_render", text="", icon=render_icon, emboss=False)
+        render_icon = 'RESTRICT_RENDER_OFF' if active_item.active_render else 'RESTRICT_RENDER_ON'
+        row.prop(active_item, "active_render", text="", icon=render_icon, emboss=False)
 
 
 # =========================================================================
