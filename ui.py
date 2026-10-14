@@ -6,16 +6,16 @@ from .modifier_manager import draw_modifiers_section
 from .uv_manager import get_uv_layer_mismatches
 
 
-def draw_uv_layer_mismatch_warning(layout, context):
+def draw_missing_uv_layer_rows(layout, context, obj):
     mismatches = get_uv_layer_mismatches(context)
-    if not mismatches:
-        return
-
-    warning_box = layout.box()
-    warning_box.alert = True
-    warning_box.label(text="选中物体的 UV 层不一致", icon='ERROR')
     for index, reason in mismatches.items():
-        warning_box.label(text=f"第 {index + 1} 层：{reason}")
+        if index < len(obj.data.uv_layers):
+            continue
+
+        row = layout.row(align=True)
+        row.active = False
+        row.label(text=f"第 {index + 1} 层", icon='ERROR')
+        row.label(text=reason)
 
 # 清除法线功能
 class CUSTOM_OT_ClearNormals(Operator):
@@ -231,7 +231,7 @@ class VIEW3D_PT_UltimateManager(Panel):
             rows=3
         )
 
-        draw_uv_layer_mismatch_warning(layout, context)
+        draw_missing_uv_layer_rows(layout, context, obj)
 
         self.draw_uv_stats(layout, context)
 
@@ -370,7 +370,7 @@ class VIEW3D_PT_UVLayerManager(Panel):
                 rows=2
             )
 
-            draw_uv_layer_mismatch_warning(list_box, context)
+            draw_missing_uv_layer_rows(list_box, context, obj)
             
             # 底部复制粘贴操作栏
             button_row = list_box.row(align=True)

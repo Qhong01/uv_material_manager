@@ -519,7 +519,7 @@ class UV_UL_LayersList(UIList):
 
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
         row = layout.row(align=True)
-        row.alert = index in get_uv_layer_mismatches(context)
+        mismatch_reason = get_uv_layer_mismatches(context).get(index)
         is_active = (index == active_data.active_index)
 
         # 单选状态指示与切换
@@ -531,7 +531,20 @@ class UV_UL_LayersList(UIList):
         )
         op.layer_index = index
 
-        row.prop(item, "name", text="", emboss=False)
+        if mismatch_reason:
+            split = row.split(factor=0.58, align=True)
+            split.prop(item, "name", text="", emboss=False)
+
+            status_row = split.row(align=True)
+            status_row.active = False
+            status_row.alignment = 'RIGHT'
+            short_reason = {
+                "部分物体缺失": "部分缺失",
+                "部分物体缺失且名称不同": "缺失且异名",
+            }.get(mismatch_reason, mismatch_reason)
+            status_row.label(text=short_reason)
+        else:
+            row.prop(item, "name", text="", emboss=False)
 
         # 渲染层相机图标
         render_icon = 'RESTRICT_RENDER_OFF' if item.active_render else 'RESTRICT_RENDER_ON'
