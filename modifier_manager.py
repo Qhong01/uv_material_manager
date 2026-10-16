@@ -1352,7 +1352,6 @@ def register():
     for handler_list in (bpy.app.handlers.load_post, bpy.app.handlers.undo_post, bpy.app.handlers.redo_post):
         if modifier_sync_reset_handler not in handler_list:
             handler_list.append(modifier_sync_reset_handler)
-    ModifierAutoSync.reset_all_states()
 
 def unregister():
     if depsgraph_update_handler in bpy.app.handlers.depsgraph_update_post:
