@@ -70,7 +70,7 @@ def get_modifier_icon(mod_type):
 
 
 # =========================================================================
-# 实时自动同步引擎 (仅在修改参数时同步，切换选中时不触发)
+# 实时自动同步引擎 (选中模型中有参数实际变化时同步，切换选中时不触发)
 # =========================================================================
 
 class ModifierSyncSnapshot(PropertyGroup):
@@ -84,6 +84,35 @@ class ModifierSyncRuntimeState(PropertyGroup):
     selection_signature: StringProperty()
     is_syncing: BoolProperty(default=False)
     warning_message: StringProperty()
+    status_message: StringProperty()
+
+
+class UMM_OT_StatusTooltip(Operator):
+    bl_idname = "wm.umm_status_tooltip"
+    bl_label = "操作提示"
+    bl_description = "悬停查看完整操作提示"
+    bl_options = {'INTERNAL'}
+
+    message: StringProperty(options={'SKIP_SAVE'})
+
+    @classmethod
+    def description(cls, context, properties):
+        return properties.message or cls.bl_description
+
+    def execute(self, context):
+        return {'FINISHED'}
+
+
+def draw_status_tooltip(layout, message, icon='INFO', alert=False):
+    status_row = layout.row(align=True)
+    status_row.alert = alert
+    button = status_row.operator(
+        UMM_OT_StatusTooltip.bl_idname,
+        text=message,
+        icon=icon,
+        emboss=False
+    )
+    button.message = message
 
 
 class ModifierAutoSync:
@@ -213,7 +242,7 @@ class ModifierAutoSync:
             cls.ensure_snapshots(scene, selected_objs)
             return
 
-        # 只在活动物体或其网格数据确实发生几何更新时检查修改器参数。
+        # 只检查本次确实发生几何更新的选中物体，活动物体和非活动选中物体都可作为同步源。
         updated_geometry_ids = set()
         for update in depsgraph.updates:
             if not update.is_updated_geometry:
@@ -221,56 +250,74 @@ class ModifierAutoSync:
             original_id = getattr(update.id, "original", None)
             if original_id is not None:
                 updated_geometry_ids.add(original_id.as_pointer())
-        if (active_obj.as_pointer() not in updated_geometry_ids
-                and active_obj.data.as_pointer() not in updated_geometry_ids):
-            return
-
-        other_selected = [o for o in selected_objs if o != active_obj]
-        if not other_selected:
-            for mod in active_obj.modifiers:
-                cls.set_snapshot(scene, active_obj, mod)
+        updated_objects = [
+            obj for obj in selected_objs
+            if (obj.as_pointer() in updated_geometry_ids
+                or (obj.data and obj.data.as_pointer() in updated_geometry_ids))
+        ]
+        if not updated_objects:
             return
 
         state.is_syncing = True
         try:
             state.warning_message = ""
-            for mod in active_obj.modifiers:
-                curr_snap = cls.get_snapshot(mod)
-                snapshot_entry = cls.find_snapshot(scene, active_obj, mod)
-                prev_snap = json.loads(snapshot_entry.data) if snapshot_entry and snapshot_entry.data else None
-
-                changed_props = []
-                if prev_snap is not None:
+            changed_values = {}
+            for source_obj in updated_objects:
+                for mod in source_obj.modifiers:
+                    snapshot_entry = cls.find_snapshot(scene, source_obj, mod)
+                    prev_snap = json.loads(snapshot_entry.data) if snapshot_entry and snapshot_entry.data else None
+                    curr_snap = cls.get_snapshot(mod)
+                    if prev_snap is None:
+                        continue
                     for prop_id, curr_val in curr_snap.items():
                         if prop_id in prev_snap and prev_snap[prop_id] != curr_val:
-                            changed_props.append((prop_id, curr_val))
+                            key = (mod.name, mod.type, prop_id)
+                            changed_values.setdefault(key, []).append((source_obj, mod, curr_val))
 
-                if changed_props:
-                    skipped_targets = []
-                    for prop_id, curr_val in changed_props:
-                        raw_val = getattr(mod, prop_id)
-                        for target_obj in other_selected:
-                            target_mod = target_obj.modifiers.get(mod.name)
-                            if (target_mod and target_mod.type == mod.type
-                                    and hasattr(target_mod, prop_id)):
-                                try:
-                                    if isinstance(curr_val, (tuple, list)):
-                                        setattr(target_mod, prop_id, list(raw_val))
-                                    else:
-                                        setattr(target_mod, prop_id, raw_val)
-                                    cls.set_snapshot(scene, target_obj, target_mod)
-                                except Exception:
-                                    pass
-                            elif target_obj.name not in skipped_targets:
-                                skipped_targets.append(target_obj.name)
-                    if skipped_targets:
-                        state.warning_message = (
-                            f"未同步 {mod.name}：以下物体缺少同名且同类型的修改器："
-                            + ", ".join(skipped_targets[:3])
-                        )
-                cls.set_snapshot(scene, active_obj, mod, curr_snap)
+            synced_counts = {}
+            if changed_values:
+                state.warning_message = ""
+                state.status_message = ""
+            for (modifier_name, modifier_type, prop_id), sources in changed_values.items():
+                distinct_values = {
+                    json.dumps(source[2], sort_keys=True)
+                    for source in sources
+                }
+                if len(distinct_values) > 1:
+                    continue
+
+                source_obj, source_mod, _serialized_value = sources[0]
+                raw_value = getattr(source_mod, prop_id)
+                for target_obj in selected_objs:
+                    if target_obj == source_obj:
+                        continue
+                    target_mod = target_obj.modifiers.get(modifier_name)
+                    if (target_mod and target_mod.type == modifier_type
+                            and hasattr(target_mod, prop_id)):
+                        try:
+                            if isinstance(raw_value, (tuple, list)):
+                                setattr(target_mod, prop_id, list(raw_value))
+                            else:
+                                setattr(target_mod, prop_id, raw_value)
+                            key = (modifier_name, prop_id)
+                            synced_counts[key] = synced_counts.get(key, 0) + 1
+                        except Exception:
+                            pass
+
+            # 同步之后统一刷新所选物体的基线，防止后续视图更新重复触发。
+            cls.ensure_snapshots(scene, selected_objs)
+            if synced_counts:
+                (modifier_name, prop_id), count = next(iter(synced_counts.items()))
+                state.status_message = f"已同步 {modifier_name} 的 {prop_id} 参数到 {count} 个物体"
         finally:
             state.is_syncing = False
+
+
+def set_modifier_status(context, message):
+    state = ModifierAutoSync.get_state(context.scene) if context.scene else None
+    if state:
+        state.warning_message = ""
+        state.status_message = message
 
 
 @persistent
@@ -314,6 +361,7 @@ class MODIFIER_OT_SelectByModifier(Operator):
             obj.select_set(True)
         context.view_layer.objects.active = matched[0]
         self.report({'INFO'}, f"已在场景中选中 {len(matched)} 个使用修改器 '{self.modifier_name}' 的物体")
+        set_modifier_status(context, f"已选择 {len(matched)} 个使用 {self.modifier_name} 的物体")
         return {'FINISHED'}
 
 
@@ -369,6 +417,7 @@ class MODIFIER_OT_AddCustom(Operator):
                 self.report({'WARNING'}, f"在物体 {obj.name} 上添加修改器失败: {str(e)}")
 
         self.report({'INFO'}, f"已为 {added_count} 个物体添加修改器")
+        set_modifier_status(context, f"已添加修改器到 {added_count} 个物体")
         return {'FINISHED'}
 
 
@@ -405,8 +454,10 @@ class MODIFIER_OT_ApplyToAll(Operator):
 
         if errors:
             self.report({'WARNING'}, f"{processed}个成功，失败{len(errors)}个：{', '.join(errors)}")
+            set_modifier_status(context, f"应用修改器：成功 {processed} 个，失败 {len(errors)} 个")
         else:
             self.report({'INFO'}, f"成功应用到 {processed} 个物体")
+            set_modifier_status(context, f"已应用修改器到 {processed} 个物体")
         return {'FINISHED'}
 
 
@@ -429,6 +480,7 @@ class MODIFIER_OT_RemoveFromSelected(Operator):
                 processed += 1
 
         self.report({'INFO'}, f"已从 {processed} 个物体移除修改器")
+        set_modifier_status(context, f"已从 {processed} 个物体移除修改器")
         return {'FINISHED'}
 
 
@@ -484,6 +536,7 @@ class MODIFIER_OT_SyncToSelected(Operator):
                 synced_count += 1
 
         self.report({'INFO'}, f"✨ 已成功将修改器 '{src_mod.name}' 同步到 {synced_count} 个物体")
+        set_modifier_status(context, f"已手动同步 {src_mod.name} 到 {synced_count} 个物体")
         return {'FINISHED'}
 
 
@@ -1214,20 +1267,25 @@ def draw_modifiers_section(layout, context):
     header_row = layout.row(align=True)
     header_row.menu("OBJECT_MT_custom_modifier_add", text="新建修改器", icon='ADD')
 
+    modifier_box = layout.box()
+    sync_state = ModifierAutoSync.get_state(context.scene)
+
+    def draw_status():
+        if not sync_state:
+            return
+        message = sync_state.status_message
+        if message:
+            draw_status_tooltip(layout, message)
+
     if not selected_objs and not active_obj:
-        layout.label(text="请选择网格物体", icon='INFO')
+        modifier_box.label(text="请选择网格物体", icon='INFO')
+        draw_status()
         return
 
     if not selected_objs and active_obj:
         selected_objs = [active_obj]
 
     selected_count = len(selected_objs)
-
-    sync_state = ModifierAutoSync.get_state(context.scene)
-    if sync_state and sync_state.warning_message:
-        warning_row = layout.row()
-        warning_row.alert = True
-        warning_row.label(text=sync_state.warning_message, icon='ERROR')
 
     # 1. 聚合所有选中物体的修改器（去重有序收集）
     unique_mod_dict = {}  # key: mod_name -> { 'type': ..., 'instance': ..., 'owner': ..., 'count': ... }
@@ -1250,11 +1308,11 @@ def draw_modifiers_section(layout, context):
                 }
 
     if not unique_mod_dict:
-        box = layout.box()
-        box.label(text="当前选中的物体无修改器", icon='INFO')
+        modifier_box.label(text="当前选中的物体无修改器", icon='INFO')
+        draw_status()
         return
 
-    main_col = layout.column(align=True)
+    main_col = modifier_box.column(align=True)
 
     # 2. 遍历聚合的修改器卡片进行绘制
     for mod_info in unique_mod_dict.values():
@@ -1311,12 +1369,15 @@ def draw_modifiers_section(layout, context):
             panel.use_property_decorate = False
             draw_modifier_body(panel, owner_obj, mod)
 
+    draw_status()
+
 
 # =========================================================================
 # 注册与注销
 # =========================================================================
 
 classes = (
+    UMM_OT_StatusTooltip,
     MODIFIER_OT_SelectByModifier,
     MODIFIER_OT_ToggleExpanded,
     MODIFIER_OT_AddCustom,

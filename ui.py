@@ -2,7 +2,7 @@ import bpy
 import bmesh
 from bpy.types import Operator, Panel
 from bpy.props import FloatProperty
-from .modifier_manager import draw_modifiers_section
+from .modifier_manager import draw_modifiers_section, draw_status_tooltip
 from .uv_manager import get_uv_layer_list_source
 
 # 清除法线功能
@@ -335,22 +335,23 @@ class VIEW3D_PT_UVLayerManager(Panel):
     def draw(self, context):
         layout = self.layout
         obj = context.object
-        
-        # 主容器
-        main_box = layout.box()
-        
-        # 工具行添加复制粘贴按钮
-        tool_row = main_box.row(align=True)
+
+        tool_row = layout.row(align=True)
         tool_row.operator("uv.add_layer_pro", icon='ADD', text="新建")
         tool_row.operator("uv.remove_layer_pro", icon='REMOVE', text="删除")
         tool_row.operator("uv.sync_layers_pro", icon='UV_SYNC_SELECT', text="同步")
         tool_row.operator("uv.select_max_layers_pro", icon='SELECT_EXTEND', text="最大层")
+        tool_row.prop(
+            context.scene.um_props,
+            "uv_sync_selected_only",
+            text="",
+            icon='RESTRICT_SELECT_OFF',
+            toggle=True
+        )
 
-        # UV层列表
-        list_box = main_box.box()
         if obj and obj.type == 'MESH':
             list_source = get_uv_layer_list_source(context, obj)
-            list_box.template_list(
+            layout.template_list(
                 "UV_UL_LayersListPro",
                 "",
                 list_source.data, "uv_layers",
@@ -359,7 +360,7 @@ class VIEW3D_PT_UVLayerManager(Panel):
             )
             
             # 底部复制粘贴操作栏
-            button_row = list_box.row(align=True)
+            button_row = layout.row(align=True)
             button_row.scale_x = 1.2  # 横向扩展按钮宽度
 
             # 左侧复制按钮
@@ -378,20 +379,22 @@ class VIEW3D_PT_UVLayerManager(Panel):
                 text="粘贴到当前层"
             )
         else:
-            list_box.label(text="请选择网格物体", icon='ERROR')
+            layout.label(text="请选择网格物体", icon='ERROR')
 
-        # 新增统计信息区块 (仅检测选择的物体，不包括未选择的物体)
-        stats_box = main_box.box()
-        row = stats_box.row(align=True)
+        row = layout.row(align=True)
         
         selected_objs = [o for o in context.selected_objects if o.type == 'MESH']
         selected_max = max((len(o.data.uv_layers) for o in selected_objs), default=0)
         selected_min = min((len(o.data.uv_layers) for o in selected_objs), default=0) if selected_objs else 0
         
-        row.label(icon='MOD_UVPROJECT')
-        row.label(text=f"最大层: {selected_max}")
-        row.separator()
-        row.label(text=f"选中: {len(selected_objs)}")
+        row.label(
+            text=f"最大层: {selected_max}  选中: {len(selected_objs)}",
+            icon='MOD_UVPROJECT'
+        )
+        status = getattr(context.scene, "um_uv_operation_status", None)
+        if status and status.message:
+            draw_status_tooltip(row, status.message)
+        row.alignment = 'LEFT'
 
 
 # UV层管理面板（UV 编辑器侧边栏）

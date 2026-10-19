@@ -2,9 +2,19 @@ import bpy
 import json
 import bmesh
 from mathutils import Vector
-from bpy.types import Operator, UIList
-from bpy.props import IntProperty
+from bpy.types import Operator, UIList, PropertyGroup
+from bpy.props import IntProperty, PointerProperty, StringProperty
 from bpy.app.handlers import persistent
+
+
+class UVOperationStatus(PropertyGroup):
+    message: StringProperty()
+
+
+def set_uv_status(context, message):
+    status = getattr(context.scene, "um_uv_operation_status", None) if context.scene else None
+    if status:
+        status.message = message
 
 # =========================================================================
 # UV层独立专属缝合边管理器 (Per-UV-Layer Seams Manager)
@@ -165,7 +175,7 @@ class UVSeamsManager:
 
 
 # =========================================================================
-# UV层自动同步引擎 (当活动物体切换UV层时，自动同步所有选中物体及专属缝合边)
+# UV层自动同步引擎 (活动层变化时按面板范围同步活动/渲染层及专属缝合边)
 # =========================================================================
 
 class UVAutoSync:
@@ -180,6 +190,39 @@ class UVAutoSync:
     @classmethod
     def record_render_index(cls, obj_name, idx):
         cls._last_render_index[obj_name] = idx
+
+    @classmethod
+    def get_sync_targets(cls, context, active_obj=None, scene=None):
+        scene = scene or context.scene
+        props = getattr(scene, "um_props", None)
+        selected_only = props.uv_sync_selected_only if props else True
+        if selected_only:
+            objects = context.selected_objects
+        else:
+            objects = scene.objects
+        return [
+            obj for obj in objects
+            if obj.type == 'MESH' and obj != active_obj
+        ]
+
+    @classmethod
+    def switch_layer_for_scope(cls, context, target_index):
+        active_obj = context.active_object if context.active_object and context.active_object.type == 'MESH' else None
+        targets = [active_obj] if active_obj else []
+        targets.extend(cls.get_sync_targets(context, active_obj))
+
+        count = 0
+        cls._is_syncing = True
+        try:
+            for obj in targets:
+                uv_layers = obj.data.uv_layers
+                if 0 <= target_index < len(uv_layers):
+                    UVSeamsManager.switch_layer_with_seams(obj, target_index)
+                    cls.record_active_index(obj.name, uv_layers.active_index)
+                    count += 1
+        finally:
+            cls._is_syncing = False
+        return count
 
     @classmethod
     def update_handler(cls, scene, depsgraph):
@@ -216,7 +259,7 @@ class UVAutoSync:
         if not has_active_change and not has_render_change:
             return
 
-        selected_objs = [o for o in context.selected_objects if o.type == 'MESH' and o != active_obj]
+        sync_targets = cls.get_sync_targets(context, active_obj, scene)
 
         cls._is_syncing = True
         try:
@@ -229,14 +272,14 @@ class UVAutoSync:
                 if new_layer_name:
                     UVSeamsManager.load_seams_for_uv(active_obj, new_layer_name)
 
-                for target_obj in selected_objs:
+                for target_obj in sync_targets:
                     t_layers = target_obj.data.uv_layers
                     if t_layers and 0 <= curr_active_idx < len(t_layers):
                         UVSeamsManager.switch_layer_with_seams(target_obj, curr_active_idx)
 
             # 2. 同步渲染UV层
             if has_render_change:
-                for target_obj in selected_objs:
+                for target_obj in sync_targets:
                     t_layers = target_obj.data.uv_layers
                     if t_layers and 0 <= curr_render_idx < len(t_layers):
                         t_layers[curr_render_idx].active_render = True
@@ -267,6 +310,7 @@ class UV_OT_AddLayer(Operator):
             layers.active_index = len(layers)-1
             UVSeamsManager.load_seams_for_uv(obj)
             sync_uv_layers(obj)
+            set_uv_status(context, f"已新建 UV 层：{new_layer.name}")
         return {'FINISHED'}
 
 
@@ -294,34 +338,55 @@ class UV_OT_RemoveLayer(Operator):
                 pass
         UVSeamsManager.load_seams_for_uv(obj)
         sync_uv_layers(obj)
+        set_uv_status(context, f"已删除 UV 层：{old_active_name or '当前层'}")
         return {'FINISHED'}
 
 
 class UV_OT_SetActiveLayerDirect(Operator):
     bl_idname = "uv.set_active_layer_direct"
     bl_label = "切换当前UV层"
-    bl_description = "点击直接将所有选中物体的当前UV层切换到此层并自动恢复专属缝合边"
+    bl_description = "按UV层管理面板设置的影响范围切换当前UV层并恢复专属缝合边"
     bl_options = {'REGISTER', 'UNDO'}
 
     layer_index: IntProperty()
 
     def execute(self, context):
-        target_index = self.layer_index
-        selected_objs = [obj for obj in context.selected_objects if obj.type == 'MESH']
-        if not selected_objs and context.object and context.object.type == 'MESH':
-            selected_objs = [context.object]
+        count = UVAutoSync.switch_layer_for_scope(context, self.layer_index)
+        set_uv_status(context, f"已切换当前 UV 层：第 {self.layer_index + 1} 层（{count} 个物体）")
+        if context.screen:
+            for area in context.screen.areas:
+                if area.type in {'IMAGE_EDITOR', 'VIEW_3D'}:
+                    area.tag_redraw()
+        return {'FINISHED'}
+
+
+class UV_OT_SetRenderLayerDirect(Operator):
+    bl_idname = "uv.set_render_layer_direct"
+    bl_label = "切换渲染UV层"
+    bl_description = "按UV层管理面板设置的影响范围切换渲染UV层"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    layer_index: IntProperty()
+
+    def execute(self, context):
+        active_obj = context.active_object if context.active_object and context.active_object.type == 'MESH' else None
+        targets = [active_obj] if active_obj else []
+        targets.extend(UVAutoSync.get_sync_targets(context, active_obj))
 
         count = 0
-        for obj in selected_objs:
+        for obj in targets:
             uv_layers = obj.data.uv_layers
-            if 0 <= target_index < len(uv_layers):
-                UVSeamsManager.switch_layer_with_seams(obj, target_index)
+            if 0 <= self.layer_index < len(uv_layers):
+                for index, layer in enumerate(uv_layers):
+                    layer.active_render = (index == self.layer_index)
+                UVAutoSync.record_render_index(obj.name, self.layer_index)
                 count += 1
 
-        for area in context.screen.areas:
-            if area.type in {'IMAGE_EDITOR', 'VIEW_3D'}:
-                area.tag_redraw()
-
+        if context.screen:
+            for area in context.screen.areas:
+                if area.type in {'IMAGE_EDITOR', 'VIEW_3D'}:
+                    area.tag_redraw()
+        set_uv_status(context, f"已切换渲染 UV 层：第 {self.layer_index + 1} 层（{count} 个物体）")
         return {'FINISHED'}
 
 
@@ -348,6 +413,7 @@ class UV_OT_SyncLayerSelection(Operator):
             if area.type in {'IMAGE_EDITOR', 'VIEW_3D'}:
                 area.tag_redraw()
 
+        set_uv_status(context, f"已将 {len(selected_objs)} 个物体切换到第 {target_index + 1} 层")
         return {'FINISHED'}
 
 
@@ -367,6 +433,7 @@ class UV_OT_SaveCurrentSeams(Operator):
             UVSeamsManager.save_seams_for_uv(obj)
 
         self.report({'INFO'}, f"已保存 {len(selected_objs)} 个物体的当前UV专属缝合边")
+        set_uv_status(context, f"已保存 {len(selected_objs)} 个物体当前 UV 层的缝合边")
         return {'FINISHED'}
 
 
@@ -391,6 +458,7 @@ class UV_OT_SeamsFromIslands(Operator):
                 area.tag_redraw()
 
         self.report({'INFO'}, f"成功根据当前UV生成并保存了 {total_seams} 条缝合边")
+        set_uv_status(context, f"已生成并保存 {total_seams} 条 UV 缝合边")
         return {'FINISHED'}
 
 
@@ -415,6 +483,7 @@ class UV_OT_ClearCurrentSeams(Operator):
                 area.tag_redraw()
 
         self.report({'INFO'}, f"已清除 {len(selected_objs)} 个物体当前层的缝合边")
+        set_uv_status(context, f"已清除 {len(selected_objs)} 个物体当前层的缝合边")
         return {'FINISHED'}
 
 
@@ -426,6 +495,7 @@ class UV_OT_SyncLayers(Operator):
     def execute(self, context):
         sync_uv_layers(context.object)
         self.report({'INFO'}, f"已同步 {len(context.selected_objects)} 个物体")
+        set_uv_status(context, f"已同步 {len(context.selected_objects)} 个物体的 UV 层")
         return {'FINISHED'}
 
 
@@ -450,6 +520,7 @@ class UV_OT_SelectMaxLayers(Operator):
         if targets:
             context.view_layer.objects.active = targets[0]
             self.report({'INFO'}, f"选中 {len(targets)} 个{max_layers}层物体")
+            set_uv_status(context, f"已选择 {len(targets)} 个具有 {max_layers} 层 UV 的物体")
         return {'FINISHED'}
 
 
@@ -546,58 +617,58 @@ class UV_UL_LayersList(UIList):
         is_active = active_item is not None and index == active_data.active_index
 
         if active_item is None:
-            row.label(text="", icon='RADIOBUT_OFF')
             split = row.split(factor=0.58, align=True)
-            split.label(text=f"第 {index + 1} 层")
+            op = split.operator(
+                "uv.set_active_layer_direct",
+                text=f"第 {index + 1} 层",
+                icon='RADIOBUT_OFF',
+                emboss=False
+            )
+            op.layer_index = index
 
             status_row = split.row(align=True)
             status_row.alert = True
-            op = status_row.operator(
-                "uv.set_active_layer_direct",
-                text="部分缺失",
-                emboss=True
-            )
-            op.layer_index = index
+            status_row.label(text="部分缺失")
             row.label(text="", icon='BLANK1')
             return
 
-        # 单选状态指示与切换
-        op = row.operator(
+        selector = row.operator(
             "uv.set_active_layer_direct",
             text="",
             icon='RADIOBUT_ON' if is_active else 'RADIOBUT_OFF',
+            depress=is_active,
             emboss=False
         )
-        op.layer_index = index
+        selector.layer_index = index
 
         if mismatch_reason:
             split = row.split(factor=0.58, align=True)
-            split.prop(active_item, "name", text="", emboss=False)
-
-            status_row = split.row(align=True)
-            status_row.alert = True
+            name_layout = split
             short_reason = {
                 "部分物体缺失": "部分缺失",
                 "部分物体缺失且名称不同": "缺失且异名",
             }.get(mismatch_reason, mismatch_reason)
-            op = status_row.operator(
-                "uv.set_active_layer_direct",
-                text=short_reason,
-                emboss=True
-            )
-            op.layer_index = index
         else:
-            row.prop(active_item, "name", text="", emboss=False)
+            name_layout = row
+            short_reason = None
+
+        name_layout.prop(active_item, "name", text="", emboss=False)
+
+        if short_reason:
+            status_row = split.row(align=True)
+            status_row.alert = True
+            status_row.label(text=short_reason)
 
         # 渲染层相机图标
         render_icon = 'RESTRICT_RENDER_OFF' if active_item.active_render else 'RESTRICT_RENDER_ON'
-        row.prop(
-            active_item,
-            "active_render",
+        render_op = row.operator(
+            "uv.set_render_layer_direct",
             text="",
             icon=render_icon,
+            depress=active_item.active_render,
             emboss=False
         )
+        render_op.layer_index = index
 
 
 # =========================================================================
@@ -719,8 +790,10 @@ class UV_OT_CopyActiveLayer(Operator):
 
         if any_partial:
             self.report({'INFO'}, f"已复制 {total_copied_objs} 个物体中选中的 {total_copied_faces} 个 UV 块/面数据")
+            set_uv_status(context, f"已复制 {total_copied_objs} 个物体的 {total_copied_faces} 个 UV 块/面")
         else:
             self.report({'INFO'}, f"已完整复制 {total_copied_objs} 个物体的当前UV层数据")
+            set_uv_status(context, f"已复制 {total_copied_objs} 个物体的当前 UV 层")
         return {'FINISHED'}
 
 
@@ -833,8 +906,10 @@ class UV_OT_PasteToActiveLayer(Operator):
 
             if partial_pasted:
                 self.report({'INFO'}, f"成功粘贴选中 UV 块到 {processed} 个物体的当前UV层")
+                set_uv_status(context, f"已粘贴选中 UV 到 {processed} 个物体")
             else:
                 self.report({'INFO'}, f"成功粘贴到 {processed} 个物体的当前UV层")
+                set_uv_status(context, f"已粘贴 UV 到 {processed} 个物体")
             return {'FINISHED'}
 
         except Exception as e:
@@ -849,11 +924,13 @@ class UV_OT_PasteToActiveLayer(Operator):
 # =========================================================================
 
 classes = (
+    UVOperationStatus,
     UV_OT_AddLayer,
     UV_OT_RemoveLayer,
     UV_OT_SyncLayers,
     UV_OT_SelectMaxLayers,
     UV_OT_SetActiveLayerDirect,
+    UV_OT_SetRenderLayerDirect,
     UV_OT_SyncLayerSelection,
     UV_UL_LayersList,
     UV_OT_CopyActiveLayer,
@@ -864,8 +941,14 @@ classes = (
 )
 
 def register():
+    bpy.utils.register_class(UVOperationStatus)
+    bpy.types.Scene.um_uv_operation_status = PointerProperty(
+        type=UVOperationStatus,
+        options={'SKIP_SAVE'}
+    )
     for cls in classes:
-        bpy.utils.register_class(cls)
+        if cls is not UVOperationStatus:
+            bpy.utils.register_class(cls)
 
     if uv_depsgraph_update_handler not in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.append(uv_depsgraph_update_handler)
@@ -876,4 +959,8 @@ def unregister():
         bpy.app.handlers.depsgraph_update_post.remove(uv_depsgraph_update_handler)
 
     for cls in reversed(classes):
-        bpy.utils.unregister_class(cls)
+        if cls is not UVOperationStatus:
+            bpy.utils.unregister_class(cls)
+    if hasattr(bpy.types.Scene, "um_uv_operation_status"):
+        del bpy.types.Scene.um_uv_operation_status
+    bpy.utils.unregister_class(UVOperationStatus)
