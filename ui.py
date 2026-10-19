@@ -341,13 +341,15 @@ class VIEW3D_PT_UVLayerManager(Panel):
         tool_row.operator("uv.remove_layer_pro", icon='REMOVE', text="删除")
         tool_row.operator("uv.sync_layers_pro", icon='UV_SYNC_SELECT', text="同步")
         tool_row.operator("uv.select_max_layers_pro", icon='SELECT_EXTEND', text="最大层")
-        tool_row.prop(
-            context.scene.um_props,
-            "uv_sync_selected_only",
-            text="",
-            icon='RESTRICT_SELECT_OFF',
-            toggle=True
-        )
+        um_props = getattr(context.scene, "um_props", None)
+        if um_props and hasattr(um_props, "uv_sync_selected_only"):
+            tool_row.prop(
+                um_props,
+                "uv_sync_selected_only",
+                text="",
+                icon='RESTRICT_SELECT_OFF',
+                toggle=True
+            )
 
         if obj and obj.type == 'MESH':
             list_source = get_uv_layer_list_source(context, obj)

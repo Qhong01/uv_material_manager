@@ -195,7 +195,7 @@ class UVAutoSync:
     def get_sync_targets(cls, context, active_obj=None, scene=None):
         scene = scene or context.scene
         props = getattr(scene, "um_props", None)
-        selected_only = props.uv_sync_selected_only if props else True
+        selected_only = getattr(props, "uv_sync_selected_only", True)
         if selected_only:
             objects = context.selected_objects
         else:
