@@ -59,6 +59,85 @@ def save_smart_loop_config(cfg):
                 pass
 
 
+def _selection_snapshot(bm):
+    return (
+        [vert for vert in bm.verts if vert.select],
+        [edge for edge in bm.edges if edge.select],
+        [face for face in bm.faces if face.select],
+        list(bm.select_history),
+    )
+
+
+def _restore_selection_snapshot(bm, snapshot):
+    selected_verts, selected_edges, selected_faces, history = snapshot
+    for sequence in (bm.verts, bm.edges, bm.faces):
+        for element in sequence:
+            element.select = False
+    for elements in (selected_verts, selected_edges, selected_faces):
+        for element in elements:
+            if element.is_valid:
+                element.select = True
+    bm.select_flush_mode()
+    bm.select_history.clear()
+    for element in history:
+        if element.is_valid and element.select:
+            bm.select_history.add(element)
+
+
+def _select_edge_under_mouse(context, event):
+    """Use Blender's own viewport hit-testing to make the clicked edge the seed."""
+    obj = context.active_object
+    if (not obj or obj.type != 'MESH' or context.mode != 'EDIT_MESH'
+            or not context.area or context.area.type != 'VIEW_3D'
+            or not context.region or context.region.type != 'WINDOW'):
+        return None
+
+    bm = bmesh.from_edit_mesh(obj.data)
+    bm.verts.ensure_lookup_table()
+    bm.edges.ensure_lookup_table()
+    snapshot = _selection_snapshot(bm)
+    previous_mode = tuple(context.tool_settings.mesh_select_mode)
+    context.tool_settings.mesh_select_mode = (False, True, False)
+
+    try:
+        with context.temp_override(
+                window=context.window,
+                area=context.area,
+                region=context.region):
+            bpy.ops.view3d.select(
+                'EXEC_DEFAULT',
+                location=(event.mouse_region_x, event.mouse_region_y),
+                deselect_all=True,
+            )
+    except (RuntimeError, TypeError):
+        context.tool_settings.mesh_select_mode = previous_mode
+        _restore_selection_snapshot(bm, snapshot)
+        bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+        return None
+
+    active = bm.select_history.active
+    if isinstance(active, bmesh.types.BMEdge) and active.select:
+        seed_edge = active
+    else:
+        selected_edges = [edge for edge in bm.edges if edge.select]
+        seed_edge = selected_edges[0] if len(selected_edges) == 1 else None
+
+    if seed_edge is None:
+        context.tool_settings.mesh_select_mode = previous_mode
+        _restore_selection_snapshot(bm, snapshot)
+        bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+        return None
+
+    for sequence in (bm.verts, bm.edges, bm.faces):
+        for element in sequence:
+            element.select = False
+    seed_edge.select_set(True)
+    bm.select_history.clear()
+    bm.select_history.add(seed_edge)
+    bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+    return seed_edge
+
+
 def _is_feature_edge(e: bmesh.types.BMEdge) -> bool:
     """判断一条边是否属于特征边（标记为锐边非 smooth，或物理开放边界）。"""
     return (not e.smooth) or (len(e.link_faces) == 1)
@@ -70,12 +149,7 @@ def _choose_next_edge(curr_vert: bmesh.types.BMVert,
                       visited_edges: set,
                       max_angle_rad: float,
                       follow_feature_creases: bool) -> bmesh.types.BMEdge | None:
-    """
-    在当前顶点选择下一条前进边：
-    - 若开启 follow_feature_creases 且当前边为锐边/特征边：
-      只沿着平滑过渡（转向偏角 < 90°，即 dot > 0.0）的特征边继续追踪；遇到 >= 90° 的直角转折坚决不拐弯，在转折点立刻停止。
-    - 否则：保持纯几何直线延伸（在 max_angle_rad 范围内找最直的边）。
-    """
+    """Continue by mesh topology first, then use direction to resolve poles."""
     candidates = [e for e in curr_vert.link_edges if e is not curr_edge and e not in visited_edges]
     if not candidates:
         return None
@@ -85,63 +159,49 @@ def _choose_next_edge(curr_vert: bmesh.types.BMVert,
         return candidates[0]
     vec_in = vec_in.normalized()
 
-    # 1. 锐边/特征折线追踪模式 (遇到 >= 90° 折角坚决不拐弯，立刻停止)
+    def direction_score(edge):
+        other_vert = edge.other_vert(curr_vert)
+        vec_out = other_vert.co - curr_vert.co
+        if vec_out.length_squared < 1e-8:
+            return -1.0
+        return vec_in.dot(vec_out.normalized())
+
+    # Preserve the optional crease-following behavior, but use the best
+    # connected feature edge rather than stopping at an arbitrary branch.
     if follow_feature_creases and _is_feature_edge(curr_edge):
         feat_candidates = [e for e in candidates if _is_feature_edge(e)]
-        if not feat_candidates:
-            return None
+        smooth_feat_candidates = [e for e in feat_candidates if direction_score(e) > 1e-4]
+        if smooth_feat_candidates:
+            return max(smooth_feat_candidates, key=direction_score)
 
-        # 过滤掉所有偏转角 >= 90° 的大折角分支 (即 vec_in · vec_out <= 0.0)
-        smooth_feat_candidates = []
-        for e in feat_candidates:
-            other_v = e.other_vert(curr_vert)
-            vec_out = other_v.co - curr_vert.co
-            length = vec_out.length
-            if length < 1e-8:
-                continue
-            vec_out_n = vec_out / length
-            dot_turn = vec_in.dot(vec_out_n)
+    # At a regular quad-flow vertex, the loop continues through the edge
+    # whose opposite vertex is not part of either face adjacent to curr_edge.
+    adjacent_face_verts = {
+        vert
+        for face in curr_edge.link_faces
+        for vert in face.verts
+        if vert is not curr_vert
+    }
+    topology_candidates = [
+        edge for edge in candidates
+        if edge.other_vert(curr_vert) not in adjacent_face_verts
+    ]
 
-            # 偏转角 < 90° (dot > 0.0) 才视为平滑弧线继续通行；>= 90° (dot <= 0.0) 直角拐弯直接截断
-            if dot_turn > 1e-4:
-                smooth_feat_candidates.append((dot_turn, e, other_v, length))
+    if len(topology_candidates) == 1:
+        return topology_candidates[0]
+    if topology_candidates:
+        # Poles can expose multiple topologically plausible continuations;
+        # prefer the one most aligned with the incoming direction.
+        return max(topology_candidates, key=direction_score)
 
-        if not smooth_feat_candidates:
-            # 所有特征候选均为 >= 90° 的大折角，在转折顶点原地停住
-            return None
-
-        if len(smooth_feat_candidates) == 1:
-            return smooth_feat_candidates[0][1]
-
-        # 多个平滑特征分支时：按共壁连续性与方向平顺度综合打分
-        inc_faces = set(curr_edge.link_faces)
-        best_e = None
-        best_score = -float('inf')
-
-        for dot_turn, e, other_v, length in smooth_feat_candidates:
-            has_shared_face = bool(inc_faces.intersection(e.link_faces))
-            shared_score = 1.5 if has_shared_face else 0.0
-            total_score = dot_turn * 1.0 + shared_score
-
-            if total_score > best_score:
-                best_score = total_score
-                best_e = e
-
-        return best_e
-
-    # 2. 纯直线延伸逻辑
+    # Irregular or open topology has no unique opposite edge. Fall back to
+    # the previous geometric continuation threshold in that case only.
     best_edge = None
     best_dot = -1.0
     min_cos = math.cos(max_angle_rad)
 
     for e in candidates:
-        other_v = e.other_vert(curr_vert)
-        vec_out = other_v.co - curr_vert.co
-        if vec_out.length_squared < 1e-8:
-            continue
-        vec_out = vec_out.normalized()
-
-        dot = vec_in.dot(vec_out)
+        dot = direction_score(e)
         if dot > best_dot:
             best_dot = dot
             best_edge = e
@@ -182,6 +242,15 @@ class MESH_OT_SmartLoopSelect(Operator):
         cfg = load_smart_loop_config()
         self.max_angle = math.radians(cfg.get("max_angle", 60.0))
         self.follow_feature_creases = cfg.get("follow_feature_creases", True)
+
+        # A mouse shortcut invoked in the 3D View uses the edge under the
+        # pointer as its seed, matching Blender's Alt-click loop workflow.
+        if (event.type in {'LEFTMOUSE', 'RIGHTMOUSE', 'MIDDLEMOUSE'}
+                and context.area and context.area.type == 'VIEW_3D'
+                and context.region and context.region.type == 'WINDOW'):
+            if _select_edge_under_mouse(context, event) is None:
+                self.report({'WARNING'}, "鼠标下没有可选边，请点击模型上的边")
+                return {'CANCELLED'}
         return self.execute(context)
 
     def draw(self, context):
@@ -218,6 +287,7 @@ class MESH_OT_SmartLoopSelect(Operator):
 
         start_edges = [active_edge] if len(initial_selected_edges) == 1 else initial_selected_edges
         all_selected_edges = set(start_edges)
+        visited_vertices = {vert for edge in start_edges for vert in edge.verts}
 
         for start_edge in start_edges:
             loop_is_closed = False
@@ -243,14 +313,20 @@ class MESH_OT_SmartLoopSelect(Operator):
 
                     chosen_other_v = chosen_edge.other_vert(curr_vert)
 
-                    # 闭环即停：首尾闭合立刻终止
-                    if len(visited_branch) >= 3 and (chosen_edge in all_selected_edges or chosen_other_v in start_edge.verts):
+                    # 已经碰到选择路径上的边时停止；到达已走过的顶点时，
+                    # 保留刚到达交汇点的边，但不再从交汇处分支继续。
+                    if chosen_edge in all_selected_edges:
+                        break
+
+                    if chosen_other_v in visited_vertices:
                         all_selected_edges.add(chosen_edge)
-                        loop_is_closed = True
+                        if chosen_other_v in start_edge.verts:
+                            loop_is_closed = True
                         break
 
                     all_selected_edges.add(chosen_edge)
                     visited_branch.add(chosen_edge)
+                    visited_vertices.add(chosen_other_v)
                     prev_vert = curr_vert
                     curr_vert = chosen_other_v
                     curr_edge = chosen_edge

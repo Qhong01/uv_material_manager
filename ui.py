@@ -133,13 +133,29 @@ class VIEW3D_PT_UltimateManager(Panel):
             tools_row.operator("view3d.toggle_outliner", text="大纲视图", icon='OUTLINER')
 
         tools_row.operator("custom.clear_normals", icon='NORMALS_FACE', text="清理法线")
-        tools_row.popover(panel="VIEW3D_PT_QuickShadingPopover", text="着色", icon='SHADING_SOLID')
+        shading_op = tools_row.operator("wm.call_panel", text="着色", icon='SHADING_SOLID')
+        shading_op.name = "VIEW3D_PT_QuickShadingPopover"
 
-        # 新增第二排建模与选择工具栏 (智能环选、90°旋转、圈内选面)
+        # 第二排建模与选择工具栏
         tools_row2 = layout.row(align=True)
         tools_row2.operator("mesh.smart_loop_select", text="智能环选", icon='MOD_EDGESPLIT')
         tools_row2.operator("view3d.open_rotate_90_menu", text="90°旋转", icon='DRIVER_ROTATIONAL_DIFFERENCE')
         tools_row2.operator("mesh.select_face_ring_region", text="圈内选面", icon='FACESEL')
+        tools_row2.operator("material.pick_material_for_selected_faces", text="吸材质", icon='EYEDROPPER')
+        # These actions are invoked from the sidebar but their shortcuts live
+        # in the 3D View window keymap. Match that region so Blender's native
+        # Change/Remove Shortcut lookup can find the assigned keymap item.
+        tools_row2.operator_context = 'INVOKE_REGION_WIN'
+        tools_row2.operator("mesh.edge_rail_rotate", text="滑动旋转", icon='DRIVER_ROTATIONAL_DIFFERENCE')
+        tools_row2.operator("object.quick_mirror_gesture", text="快速镜像", icon='MOD_MIRROR')
+
+        focus_row = layout.row(align=True)
+        focus_row.menu("VIEW3D_MT_uvmm_focus_actions", text="聚焦", icon='VIEWZOOM')
+        # Invoke in the 3D View window region so Blender's native right-click
+        # Assign/Change/Remove Shortcut actions target the same keymap context.
+        focus_row.operator_context = 'INVOKE_REGION_WIN'
+        focus_row.operator("mesh.uvmm_smart_vertex", text="智能顶点", icon='VERTEXSEL')
+        focus_row.operator("mesh.uvmm_smart_edge", text="智能边", icon='EDGESEL')
 
         # 1. 动态自定义分屏工具栏 (第三排：只放分屏功能按键，右侧保留配置齿轮)
         from .workspace import get_editor_icon

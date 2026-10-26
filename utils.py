@@ -84,6 +84,11 @@ class UMProperties(PropertyGroup):
     material_list_index: IntProperty()
     material_collection: CollectionProperty(type=MaterialListItem)
     uv_layout_active: BoolProperty(default=False)
+    uv_sync_selected_only: BoolProperty(
+        name="仅影响选中模型",
+        description="开启时切换当前/渲染 UV 层只影响选中模型；关闭时影响当前场景全部网格模型",
+        default=True
+    )
     global_sync_active: BoolProperty(
         name="全局同步状态",
         default=False,

@@ -3,9 +3,11 @@ import json
 import shutil
 import bpy
 import bmesh
+import blf
 import time
 from bpy.types import Operator, UIList
 from bpy.props import StringProperty
+from bpy_extras import view3d_utils
 from bpy_extras.io_utils import ExportHelper, ImportHelper
 from .utils import StateManager, select_material_objects_by_name
 
@@ -1423,6 +1425,372 @@ class MATERIAL_OT_AssignToSelectedFaces(Operator):
         return {'FINISHED'}
 
 
+def _capture_selected_edit_faces(context):
+    targets = []
+    edit_objects = getattr(context, "objects_in_mode", ())
+    for obj in edit_objects:
+        if obj.type != 'MESH' or not obj.visible_get():
+            continue
+        bm = bmesh.from_edit_mesh(obj.data)
+        bm.faces.ensure_lookup_table()
+        bm.faces.index_update()
+        face_indices = tuple(face.index for face in bm.faces if face.select)
+        if face_indices:
+            targets.append((obj, face_indices))
+    return targets
+
+
+def _capture_selected_mesh_objects(context):
+    return tuple(
+        obj for obj in context.selected_objects
+        if obj.type == 'MESH' and obj.visible_get()
+    )
+
+
+def _assign_material_to_selected_objects(targets, material):
+    target_set = set(targets)
+    empty_meshes = {obj.data for obj in targets if not obj.material_slots}
+    for obj in targets:
+        if obj.library or obj.data.library:
+            raise ValueError(f"{obj.name} 来自链接库，无法安全修改")
+    for mesh in empty_meshes:
+        outside_users = [
+            obj for obj in bpy.data.objects
+            if obj.type == 'MESH' and obj.data == mesh and obj not in target_set
+        ]
+        if outside_users:
+            raise ValueError(f"{mesh.name} 被未选中物体共用且没有材质槽，为避免影响它们已取消")
+
+    original_slots = {
+        obj: tuple((slot.link, slot.material) for slot in obj.material_slots)
+        for obj in targets
+    }
+    added_meshes = []
+    try:
+        for mesh in empty_meshes:
+            mesh.materials.append(None)
+            added_meshes.append(mesh)
+        for obj in targets:
+            for slot in obj.material_slots:
+                slot.link = 'OBJECT'
+                slot.material = material
+    except (ReferenceError, RuntimeError, TypeError, ValueError):
+        for obj, slots in original_slots.items():
+            for slot, (link, previous_material) in zip(obj.material_slots, slots):
+                slot.material = previous_material
+                slot.link = link
+        for mesh in reversed(added_meshes):
+            mesh.materials.pop(index=len(mesh.materials) - 1)
+        raise
+    return len(targets)
+
+
+def _assign_material_to_captured_faces(targets, material):
+    targets_by_mesh = {}
+    target_objects = {obj for obj, _face_indices in targets}
+    for obj, face_indices in targets:
+        targets_by_mesh.setdefault(obj.data, []).append((obj, face_indices))
+
+    for mesh, mesh_targets in targets_by_mesh.items():
+        outside_users = [
+            obj for obj in bpy.data.objects
+            if obj.type == 'MESH' and obj.data == mesh and obj not in target_objects
+        ]
+        if outside_users:
+            names = ", ".join(obj.name for obj in outside_users[:3])
+            raise ValueError(f"网格数据被未参与操作的物体共用（{names}），为避免影响它们已取消")
+        if mesh.library or any(obj.library for obj, _face_indices in mesh_targets):
+            raise ValueError("目标物体或网格来自链接库，无法安全修改")
+
+    mesh_plans = []
+    for mesh, mesh_targets in targets_by_mesh.items():
+        bm = bmesh.from_edit_mesh(mesh)
+        bm.faces.ensure_lookup_table()
+        bm.faces.index_update()
+        face_indices = {
+            index
+            for _obj, indices in mesh_targets
+            for index in indices
+        }
+        if any(index < 0 or index >= len(bm.faces) for index in face_indices):
+            raise ValueError("等待取样期间网格拓扑发生变化，请重新选择目标面后再试")
+
+        common_slot_index = next(
+            (
+                index for index in range(min(len(obj.material_slots) for obj, _ in mesh_targets))
+                if all(obj.material_slots[index].material == material for obj, _ in mesh_targets)
+            ),
+            -1
+        )
+        mesh_plans.append((mesh, mesh_targets, bm, face_indices, common_slot_index))
+
+    assigned_face_count = 0
+    for mesh, mesh_targets, bm, face_indices, common_slot_index in mesh_plans:
+        if common_slot_index < 0:
+            mesh.materials.append(material)
+            common_slot_index = len(mesh.materials) - 1
+            for obj, _face_indices in mesh_targets:
+                slot = obj.material_slots[common_slot_index]
+                if slot.link != 'DATA':
+                    slot.link = 'DATA'
+
+        for index in face_indices:
+            bm.faces[index].material_index = common_slot_index
+        bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
+        assigned_face_count += len(face_indices)
+
+    return assigned_face_count
+
+
+class MATERIAL_OT_PickMaterialForSelectedFaces(Operator):
+    """从视口点击的面取材质，赋予已选面或物体"""
+    bl_idname = "material.pick_material_for_selected_faces"
+    bl_label = "吸取材质并赋予所选面"
+    bl_description = "编辑模式替换已选面；物体模式替换已选模型的全部材质"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        if context.area is None or context.area.type != 'VIEW_3D':
+            return False
+        if context.mode == 'EDIT_MESH':
+            return bool(_capture_selected_edit_faces(context))
+        if context.mode == 'OBJECT':
+            return bool(_capture_selected_mesh_objects(context))
+        return False
+
+    def invoke(self, context, event):
+        if not context.area or context.area.type != 'VIEW_3D':
+            self.report({'WARNING'}, "请从 3D 视图启动材质吸取")
+            return {'CANCELLED'}
+
+        self._target_mode = context.mode
+        if self._target_mode == 'EDIT_MESH':
+            self._target_faces = _capture_selected_edit_faces(context)
+            if not self._target_faces:
+                self.report({'WARNING'}, "请先在编辑模式下选择要替换材质的面")
+                return {'CANCELLED'}
+        elif self._target_mode == 'OBJECT':
+            self._target_objects = _capture_selected_mesh_objects(context)
+            if not self._target_objects:
+                self.report({'WARNING'}, "请先在物体模式下选择要替换材质的模型")
+                return {'CANCELLED'}
+        else:
+            self.report({'WARNING'}, "请在物体模式或网格编辑模式使用材质吸管")
+            return {'CANCELLED'}
+
+        self._area = context.area
+        self._window = context.window
+        self._sample_on_right_release = event.type == 'RIGHTMOUSE' and event.value == 'PRESS'
+        self._cursor_is_set = False
+        self._hover_name = ""
+        self._hover_x = 0
+        self._hover_y = 0
+        self._draw_handle = bpy.types.SpaceView3D.draw_handler_add(
+            self._draw_hover_name, (), 'WINDOW', 'POST_PIXEL'
+        )
+        try:
+            self._window.cursor_modal_set('EYEDROPPER')
+            self._cursor_is_set = True
+        except (TypeError, RuntimeError):
+            self._window.cursor_modal_set('CROSSHAIR')
+            self._cursor_is_set = True
+
+        context.window_manager.modal_handler_add(self)
+        if self._sample_on_right_release:
+            self.report({'INFO'}, "按住右键移动到材质面，松开右键取样；按 Esc 取消")
+        else:
+            self.report({'INFO'}, "点击一个有材质的面取样；按 Esc 取消")
+        return {'RUNNING_MODAL'}
+
+    def _restore_cursor(self):
+        if getattr(self, "_cursor_is_set", False):
+            try:
+                self._window.cursor_modal_restore()
+            except (ReferenceError, RuntimeError):
+                pass
+            self._cursor_is_set = False
+
+    def _draw_hover_name(self):
+        if not self._hover_name or bpy.context.area != self._area:
+            return
+        font_id = 0
+        blf.size(font_id, 14)
+        blf.color(font_id, 1.0, 1.0, 1.0, 1.0)
+        blf.enable(font_id, blf.SHADOW)
+        blf.shadow(font_id, 3, 0.0, 0.0, 0.0, 1.0)
+        blf.shadow_offset(font_id, 1, -1)
+        blf.position(font_id, self._hover_x + 18, self._hover_y + 18, 0)
+        blf.draw(font_id, f"材质：{self._hover_name}")
+        blf.disable(font_id, blf.SHADOW)
+
+    def _cleanup(self):
+        handle = getattr(self, "_draw_handle", None)
+        if handle is not None:
+            bpy.types.SpaceView3D.draw_handler_remove(handle, 'WINDOW')
+            self._draw_handle = None
+            self._area.tag_redraw()
+        self._restore_cursor()
+
+    def _pick_material(self, context, event):
+        area = self._area
+        region = next((item for item in area.regions if item.type == 'WINDOW'), None)
+        if not region:
+            return None, "找不到 3D 视口区域，请取消后重试"
+        if not (region.x <= event.mouse_x < region.x + region.width
+                and region.y <= event.mouse_y < region.y + region.height):
+            return None, "请在 3D 视口中的模型表面点击"
+
+        coord = (event.mouse_x - region.x, event.mouse_y - region.y)
+        region_3d = area.spaces.active.region_3d
+        ray_origin = view3d_utils.region_2d_to_origin_3d(region, region_3d, coord)
+        ray_direction = view3d_utils.region_2d_to_vector_3d(region, region_3d, coord)
+        depsgraph = context.evaluated_depsgraph_get()
+        viewport = area.spaces.active
+        hit = False
+        hit_obj = None
+        face_index = -1
+        nearest_distance_squared = float("inf")
+
+        # Scene.ray_cast can hit meshes that are not shown in this viewport.
+        # Test only viewport-visible meshes so hidden objects and Local View
+        # exclusions cannot occlude the surface under the eyedropper.
+        for candidate_obj in context.view_layer.objects:
+            if candidate_obj.type != 'MESH' or not candidate_obj.visible_get(
+                    view_layer=context.view_layer, viewport=viewport):
+                continue
+
+            evaluated_obj = candidate_obj.evaluated_get(depsgraph)
+            world_to_local = evaluated_obj.matrix_world.inverted_safe()
+            local_origin = world_to_local @ ray_origin
+            local_direction = world_to_local.to_3x3() @ ray_direction
+            if local_direction.length_squared < 1e-12:
+                continue
+            local_direction.normalize()
+
+            object_hit, local_location, _normal, object_face_index = evaluated_obj.ray_cast(
+                local_origin, local_direction, depsgraph=depsgraph
+            )
+            if not object_hit:
+                continue
+
+            world_location = evaluated_obj.matrix_world @ local_location
+            distance_squared = (world_location - ray_origin).length_squared
+            if distance_squared < nearest_distance_squared:
+                hit = True
+                nearest_distance_squared = distance_squared
+                face_index = object_face_index
+                hit_obj = evaluated_obj
+
+        if not hit or not hit_obj or hit_obj.type != 'MESH':
+            return None, "没有点中带材质的网格面，请再点一次或按 Esc 取消"
+
+        source_obj = hit_obj.original if hit_obj.is_evaluated else hit_obj
+        if context.mode == 'EDIT_MESH' and source_obj.mode == 'EDIT':
+            bm = bmesh.from_edit_mesh(source_obj.data)
+            bm.faces.ensure_lookup_table()
+            if face_index < 0 or face_index >= len(bm.faces):
+                return None, "无法读取点中面的材质，请再点一次或按 Esc 取消"
+            material_index = bm.faces[face_index].material_index
+        else:
+            depsgraph = context.evaluated_depsgraph_get()
+            evaluated_obj = hit_obj.evaluated_get(depsgraph)
+            if face_index < 0 or face_index >= len(evaluated_obj.data.polygons):
+                return None, "无法读取点中面的材质，请再点一次或按 Esc 取消"
+            material_index = evaluated_obj.data.polygons[face_index].material_index
+
+        if material_index < 0 or material_index >= len(source_obj.material_slots):
+            return None, "点中的面没有有效材质，请再点一次或按 Esc 取消"
+        material = source_obj.material_slots[material_index].material
+        if not material:
+            return None, "点中的面没有材质，请再点一次或按 Esc 取消"
+        return material, ""
+
+    def modal(self, context, event):
+        if (event.value == 'PRESS' and
+                (event.type == 'ESC' or
+                 (event.type == 'RIGHTMOUSE' and not self._sample_on_right_release
+                  and not (event.ctrl or event.shift or event.alt)))):
+            self._cleanup()
+            self.report({'INFO'}, "已取消材质吸取")
+            return {'CANCELLED'}
+
+        if event.type == 'MOUSEMOVE':
+            try:
+                material, _error_message = self._pick_material(context, event)
+                region = next((item for item in self._area.regions if item.type == 'WINDOW'), None)
+                self._hover_name = material.name if material else ""
+                if region:
+                    self._hover_x = event.mouse_x - region.x
+                    self._hover_y = event.mouse_y - region.y
+                self._area.tag_redraw()
+            except (ReferenceError, RuntimeError, TypeError, ValueError) as exc:
+                self._cleanup()
+                self.report({'ERROR'}, f"材质预览失败：{exc}")
+                return {'CANCELLED'}
+            return {'RUNNING_MODAL'}
+
+        right_release = (self._sample_on_right_release and
+                         event.type == 'RIGHTMOUSE' and event.value == 'RELEASE')
+        left_press = (not self._sample_on_right_release and
+                      event.type == 'LEFTMOUSE' and event.value == 'PRESS')
+        if right_release or left_press:
+            try:
+                material, error_message = self._pick_material(context, event)
+                if not material:
+                    if right_release:
+                        self._cleanup()
+                    self.report({'WARNING'}, error_message)
+                    return {'CANCELLED'} if right_release else {'RUNNING_MODAL'}
+
+                if self._target_mode == 'EDIT_MESH':
+                    count = _assign_material_to_captured_faces(self._target_faces, material)
+                    target_label = "个已选面"
+                else:
+                    count = _assign_material_to_selected_objects(self._target_objects, material)
+                    target_label = "个已选模型"
+                self._cleanup()
+                self.report({'INFO'}, f"已将材质“{material.name}”赋予 {count} {target_label}")
+                return {'FINISHED'}
+            except (ReferenceError, RuntimeError, TypeError, ValueError) as exc:
+                self._cleanup()
+                self.report({'ERROR'}, f"吸取材质失败：{exc}")
+                return {'CANCELLED'}
+
+        return {'RUNNING_MODAL'}
+
+
+def unregister_pick_material_keymap():
+    window_manager = getattr(bpy.context, 'window_manager', None)
+    keyconfig = window_manager.keyconfigs.addon if window_manager else None
+    if not keyconfig:
+        return
+    for keymap_name in ('Mesh', 'Object Mode'):
+        keymap = keyconfig.keymaps.get(keymap_name)
+        if keymap:
+            for item in list(keymap.keymap_items):
+                if item.idname == MATERIAL_OT_PickMaterialForSelectedFaces.bl_idname:
+                    keymap.keymap_items.remove(item)
+
+
+def register_pick_material_keymap():
+    window_manager = getattr(bpy.context, 'window_manager', None)
+    keyconfig = window_manager.keyconfigs.addon if window_manager else None
+    if not keyconfig:
+        return
+    unregister_pick_material_keymap()
+    for keymap_name in ('Mesh', 'Object Mode'):
+        keymap = keyconfig.keymaps.new(name=keymap_name, space_type='EMPTY', region_type='WINDOW')
+        keymap.keymap_items.new(
+            MATERIAL_OT_PickMaterialForSelectedFaces.bl_idname,
+            type='RIGHTMOUSE',
+            value='PRESS',
+            ctrl=True,
+            shift=True,
+            alt=True,
+        )
+
+
 class MATERIAL_OT_ItemActionsPopup(Operator):
     """材质操作菜单"""
     bl_idname = "material.item_actions_popup"
@@ -1563,15 +1931,18 @@ def register():
     bpy.utils.register_class(MATERIAL_OT_HandleClick)
     bpy.utils.register_class(MATERIAL_OT_SelectFaces)
     bpy.utils.register_class(MATERIAL_OT_AssignToSelectedFaces)
+    bpy.utils.register_class(MATERIAL_OT_PickMaterialForSelectedFaces)
     bpy.utils.register_class(MATERIAL_OT_ItemActionsPopup)
     bpy.utils.register_class(MATERIAL_UL_CustomList)
     bpy.utils.register_class(MATERIAL_OT_UpdateList)
+    register_pick_material_keymap()
     
     if hasattr(bpy.types, "UI_MT_button_context_menu"):
         bpy.types.UI_MT_button_context_menu.append(draw_template_button_context_menu)
 
 # 注销函数
 def unregister():
+    unregister_pick_material_keymap()
     if hasattr(bpy.types, "UI_MT_button_context_menu"):
         try:
             bpy.types.UI_MT_button_context_menu.remove(draw_template_button_context_menu)
@@ -1581,6 +1952,7 @@ def unregister():
     bpy.utils.unregister_class(MATERIAL_OT_UpdateList)
     bpy.utils.unregister_class(MATERIAL_UL_CustomList)
     bpy.utils.unregister_class(MATERIAL_OT_ItemActionsPopup)
+    bpy.utils.unregister_class(MATERIAL_OT_PickMaterialForSelectedFaces)
     bpy.utils.unregister_class(MATERIAL_OT_AssignToSelectedFaces)
     bpy.utils.unregister_class(MATERIAL_OT_SelectFaces)
     bpy.utils.unregister_class(MATERIAL_OT_HandleClick)
