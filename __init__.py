@@ -81,8 +81,8 @@ class UVMM_AddonPreferences(AddonPreferences):
 
     model_checker_migrated: BoolProperty(default=False, options={'HIDDEN'})
     uv_mode_normalizing: BoolProperty(default=False, options={'HIDDEN', 'SKIP_SAVE'})
-    ngon_clear_selection: BoolProperty(name="运行前清除其他选择", default=True)
-    ngon_sides: IntProperty(name="边数大于", description="顶点数超过此值的面会被选中", default=4, min=3, max=100)
+    ngon_clear_selection: BoolProperty(name="运行前清除其他选择", default=True, update=model_checker._schedule_preferences_save)
+    ngon_sides: IntProperty(name="边数大于", description="顶点数超过此值的面会被选中", default=4, min=3, max=100, update=model_checker._schedule_preferences_save)
     uv_show_stretch: BoolProperty(name="显示 UV 拉伸", default=False, update=model_checker._update_scene_overlay)
     uv_stretch_opacity: FloatProperty(name="热力图透明度", default=0.85, min=0.0, max=1.0, update=model_checker._update_scene_overlay)
     uv_stretch_base_color: FloatVectorProperty(name="无拉伸颜色", subtype='COLOR', size=3, default=(0.43, 0.78, 1.0), min=0.0, max=1.0, update=model_checker._update_scene_overlay)
@@ -91,17 +91,18 @@ class UVMM_AddonPreferences(AddonPreferences):
     uv_stretch_threshold: FloatProperty(name="可接受拉伸阈值", description="低于此阈值的拉伸按无拉伸颜色显示", default=0.0, min=0.0, max=0.999, subtype='PERCENTAGE', update=model_checker._update_scene_overlay)
     uv_show_boundaries: BoolProperty(name="显示 UV 分界边", default=False, update=model_checker._update_scene_overlay)
     uv_boundary_color: FloatVectorProperty(name="边界颜色", subtype='COLOR', size=3, default=(1.0, 0.55, 0.08), min=0.0, max=1.0, update=model_checker._update_scene_overlay)
+    uv_boundary_width: FloatProperty(name="分界线粗细", default=4.0, min=1.0, max=12.0, update=model_checker._update_boundary_width)
     uv_show_checker: BoolProperty(name="显示棋盘格", default=False, update=model_checker._update_scene_overlay)
-    uv_checker_opacity: FloatProperty(name="棋盘格透明度", default=0.75, min=0.0, max=1.0, update=model_checker._update_scene_overlay)
-    uv_checker_density: IntProperty(name="棋盘格密度", default=8, min=1, max=256, update=model_checker._update_scene_overlay)
-    uv_checker_color_a: FloatVectorProperty(name="棋盘格颜色 A", subtype='COLOR', size=3, default=(0.95, 0.95, 0.95), min=0.0, max=1.0, update=model_checker._update_scene_overlay)
-    uv_checker_color_b: FloatVectorProperty(name="棋盘格颜色 B", subtype='COLOR', size=3, default=(0.12, 0.12, 0.12), min=0.0, max=1.0, update=model_checker._update_scene_overlay)
+    uv_checker_opacity: FloatProperty(name="棋盘格透明度", default=0.75, min=0.0, max=1.0, update=model_checker._update_checker_settings)
+    uv_checker_density: IntProperty(name="棋盘格密度", default=8, min=1, max=256, update=model_checker._update_checker_settings)
+    uv_checker_color_a: FloatVectorProperty(name="棋盘格颜色 A", subtype='COLOR', size=3, default=(0.95, 0.95, 0.95), min=0.0, max=1.0, update=model_checker._update_checker_settings)
+    uv_checker_color_b: FloatVectorProperty(name="棋盘格颜色 B", subtype='COLOR', size=3, default=(0.12, 0.12, 0.12), min=0.0, max=1.0, update=model_checker._update_checker_settings)
     uv_show_orientation: BoolProperty(name="显示 UV 正反", default=False, update=model_checker._update_scene_overlay)
     uv_orientation_opacity: FloatProperty(name="UV 正反透明度", default=0.9, min=0.0, max=1.0, update=model_checker._update_scene_overlay)
     uv_orientation_front_color: FloatVectorProperty(name="正向颜色", subtype='COLOR', size=3, default=(0.43, 0.78, 1.0), min=0.0, max=1.0, update=model_checker._update_scene_overlay)
     uv_orientation_back_color: FloatVectorProperty(name="反向颜色", subtype='COLOR', size=3, default=(0.94, 0.045, 0.055), min=0.0, max=1.0, update=model_checker._update_scene_overlay)
-    isolated_include_hidden: BoolProperty(name="包括隐藏顶点", default=False)
-    isolated_clear_selection: BoolProperty(name="运行前清除其他选择", default=True)
+    isolated_include_hidden: BoolProperty(name="包括隐藏顶点", default=False, update=model_checker._schedule_preferences_save)
+    isolated_clear_selection: BoolProperty(name="运行前清除其他选择", default=True, update=model_checker._schedule_preferences_save)
     uv_overlay_tuning_version: IntProperty(default=0, options={'HIDDEN'})
 
     def draw(self, context):
@@ -124,7 +125,6 @@ class UVMM_AddonPreferences(AddonPreferences):
         row.operator("material.import_template_library", text="导入材质库 (.blend)", icon='IMPORT')
         row.operator("material.open_template_library_folder", text="打开存放文件夹", icon='FILE_FOLDER')
         layout.separator()
-        model_checker.draw_preferences(layout, self)
 
 def safe_register_class(cls):
     try:

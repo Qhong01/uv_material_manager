@@ -1,12 +1,45 @@
-"""Individual model checks and their per-feature settings popups."""
+"""Individual model checks with settings in Blender's last-operation panel."""
 
 import bpy
 import bmesh
-from bpy.props import EnumProperty
+from bpy.props import BoolProperty, EnumProperty, FloatProperty, FloatVectorProperty, IntProperty
 
 from . import diagnostic
 
 ADDON_ID = __package__.split('.')[0]
+
+_UV_FEATURE_SETTINGS = {
+    'uv_show_stretch': (
+        "uv_stretch_base_color", "uv_stretch_max_color", "uv_stretch_strength",
+        "uv_stretch_threshold", "uv_stretch_opacity",
+    ),
+    'uv_show_boundaries': ("uv_boundary_color", "uv_boundary_width"),
+    'uv_show_checker': (
+        "uv_checker_opacity", "uv_checker_density", "uv_checker_color_a",
+        "uv_checker_color_b",
+    ),
+    'uv_show_orientation': (
+        "uv_orientation_front_color", "uv_orientation_back_color",
+        "uv_orientation_opacity",
+    ),
+}
+
+
+def _copy_preferences_to_operator(operator, prefs, names):
+    for name in names:
+        setattr(operator, name, getattr(prefs, name))
+
+
+def _copy_operator_to_preferences(operator, prefs, names):
+    for name in names:
+        value = getattr(operator, name)
+        current = getattr(prefs, name)
+        if hasattr(value, "__len__") and not isinstance(value, str):
+            differs = tuple(value) != tuple(current)
+        else:
+            differs = value != current
+        if differs:
+            setattr(prefs, name, value)
 
 
 def _selected_meshes(context):
@@ -176,9 +209,25 @@ class MC_OT_check_ngons(bpy.types.Operator):
     bl_description = "选中顶点数超过设置阈值的面"
     bl_options = {'REGISTER', 'UNDO'}
 
+    ngon_sides: IntProperty(name="边数大于", default=4, min=3, max=100)
+    ngon_clear_selection: BoolProperty(name="运行前清除其他选择", default=True)
+
     @classmethod
     def poll(cls, context):
         return _has_selected_mesh(context)
+
+    def invoke(self, context, event):
+        prefs = _read_preferences(context)
+        if prefs is None:
+            return {'CANCELLED'}
+        _copy_preferences_to_operator(self, prefs, ("ngon_sides", "ngon_clear_selection"))
+        return self.execute(context)
+
+    def draw(self, context):
+        row = self.layout.row()
+        row.label(text="边数大于")
+        row.prop(self, "ngon_sides", text="")
+        self.layout.prop(self, "ngon_clear_selection")
 
     def execute(self, context):
         prefs = _read_preferences(context)
@@ -189,13 +238,16 @@ class MC_OT_check_ngons(bpy.types.Operator):
             faces, _ = _select_findings(
                 context,
                 check_ngons=True,
-                ngon_sides=prefs.ngon_sides,
-                clear_selection=prefs.ngon_clear_selection,
+                ngon_sides=self.ngon_sides,
+                clear_selection=self.ngon_clear_selection,
             )
         except RuntimeError as exc:
             self.report({'ERROR'}, f"无法进入网格编辑模式：{exc}")
             return {'CANCELLED'}
         self.report({'INFO'}, f"已选中 {faces} 个多边面")
+        _copy_operator_to_preferences(
+            self, prefs, ("ngon_sides", "ngon_clear_selection"),
+        )
         _tag_viewports(context)
         return {'FINISHED'}
 
@@ -206,9 +258,25 @@ class MC_OT_check_isolated_vertices(bpy.types.Operator):
     bl_description = "选中没有连接边的顶点"
     bl_options = {'REGISTER', 'UNDO'}
 
+    isolated_include_hidden: BoolProperty(name="包括隐藏顶点", default=False)
+    isolated_clear_selection: BoolProperty(name="运行前清除其他选择", default=True)
+
     @classmethod
     def poll(cls, context):
         return _has_selected_mesh(context)
+
+    def invoke(self, context, event):
+        prefs = _read_preferences(context)
+        if prefs is None:
+            return {'CANCELLED'}
+        _copy_preferences_to_operator(
+            self, prefs, ("isolated_include_hidden", "isolated_clear_selection"),
+        )
+        return self.execute(context)
+
+    def draw(self, context):
+        self.layout.prop(self, "isolated_include_hidden")
+        self.layout.prop(self, "isolated_clear_selection")
 
     def execute(self, context):
         prefs = _read_preferences(context)
@@ -219,13 +287,16 @@ class MC_OT_check_isolated_vertices(bpy.types.Operator):
             _, vertices = _select_findings(
                 context,
                 check_isolated=True,
-                clear_selection=prefs.isolated_clear_selection,
-                isolated_include_hidden=prefs.isolated_include_hidden,
+                clear_selection=self.isolated_clear_selection,
+                isolated_include_hidden=self.isolated_include_hidden,
             )
         except RuntimeError as exc:
             self.report({'ERROR'}, f"无法进入网格编辑模式：{exc}")
             return {'CANCELLED'}
         self.report({'INFO'}, f"已选中 {vertices} 个孤立顶点")
+        _copy_operator_to_preferences(
+            self, prefs, ("isolated_include_hidden", "isolated_clear_selection"),
+        )
         _tag_viewports(context)
         return {'FINISHED'}
 
@@ -245,6 +316,21 @@ class MC_OT_toggle_uv_overlay(bpy.types.Operator):
             ('uv_show_orientation', "UV 正反", "切换 UV 正反显示"),
         ),
     )
+    enabled: BoolProperty(name="启用显示", default=False, options={'HIDDEN'})
+    uv_stretch_base_color: FloatVectorProperty(name="无拉伸颜色", subtype='COLOR', size=3, default=(0.43, 0.78, 1.0), min=0.0, max=1.0)
+    uv_stretch_max_color: FloatVectorProperty(name="拉伸颜色", subtype='COLOR', size=3, default=(0.72, 0.34, 0.025), min=0.0, max=1.0)
+    uv_stretch_strength: FloatProperty(name="拉伸显示强度", default=2.0, min=0.25, max=8.0)
+    uv_stretch_threshold: FloatProperty(name="可接受拉伸阈值", default=0.0, min=0.0, max=0.999, subtype='PERCENTAGE')
+    uv_stretch_opacity: FloatProperty(name="热力图透明度", default=0.85, min=0.0, max=1.0)
+    uv_boundary_color: FloatVectorProperty(name="边界颜色", subtype='COLOR', size=3, default=(1.0, 0.55, 0.08), min=0.0, max=1.0)
+    uv_boundary_width: FloatProperty(name="分界线粗细", default=4.0, min=1.0, max=12.0)
+    uv_checker_opacity: FloatProperty(name="棋盘格透明度", default=0.75, min=0.0, max=1.0)
+    uv_checker_density: IntProperty(name="棋盘格密度", default=8, min=1, max=256)
+    uv_checker_color_a: FloatVectorProperty(name="棋盘格颜色 A", subtype='COLOR', size=3, default=(0.95, 0.95, 0.95), min=0.0, max=1.0)
+    uv_checker_color_b: FloatVectorProperty(name="棋盘格颜色 B", subtype='COLOR', size=3, default=(0.12, 0.12, 0.12), min=0.0, max=1.0)
+    uv_orientation_front_color: FloatVectorProperty(name="正向颜色", subtype='COLOR', size=3, default=(0.43, 0.78, 1.0), min=0.0, max=1.0)
+    uv_orientation_back_color: FloatVectorProperty(name="反向颜色", subtype='COLOR', size=3, default=(0.94, 0.045, 0.055), min=0.0, max=1.0)
+    uv_orientation_opacity: FloatProperty(name="UV 正反透明度", default=0.9, min=0.0, max=1.0)
 
     @classmethod
     def poll(cls, context):
@@ -255,19 +341,55 @@ class MC_OT_toggle_uv_overlay(bpy.types.Operator):
             and bool(_visible_meshes(context))
         )
 
+    def invoke(self, context, event):
+        prefs = _read_preferences(context)
+        if prefs is None:
+            return {'CANCELLED'}
+        self.enabled = not bool(getattr(prefs, self.feature))
+        _copy_preferences_to_operator(self, prefs, _UV_FEATURE_SETTINGS[self.feature])
+        return self.execute(context)
+
+    def draw(self, context):
+        layout = self.layout
+        if self.feature == 'uv_show_stretch':
+            layout.label(text="UV 拉伸")
+            layout.prop(self, "uv_stretch_base_color")
+            layout.prop(self, "uv_stretch_max_color")
+            layout.prop(self, "uv_stretch_strength", slider=True)
+            layout.prop(self, "uv_stretch_threshold", slider=True)
+            layout.prop(self, "uv_stretch_opacity", slider=True)
+        elif self.feature == 'uv_show_boundaries':
+            layout.label(text="UV 分界边")
+            layout.prop(self, "uv_boundary_color")
+            layout.prop(self, "uv_boundary_width", slider=True)
+        elif self.feature == 'uv_show_checker':
+            layout.label(text="棋盘格")
+            layout.prop(self, "uv_checker_opacity", slider=True)
+            layout.prop(self, "uv_checker_density")
+            layout.prop(self, "uv_checker_color_a")
+            layout.prop(self, "uv_checker_color_b")
+        else:
+            layout.label(text="UV 正反")
+            layout.prop(self, "uv_orientation_front_color")
+            layout.prop(self, "uv_orientation_back_color")
+            layout.prop(self, "uv_orientation_opacity", slider=True)
+
     def execute(self, context):
         prefs = _read_preferences(context)
         if prefs is None:
             self.report({'ERROR'}, "模型检查插件设置不可用")
             return {'CANCELLED'}
+        setting_names = _UV_FEATURE_SETTINGS[self.feature]
+        _copy_operator_to_preferences(self, prefs, setting_names)
         previous_value = getattr(prefs, self.feature)
-        next_value = not previous_value
+        next_value = self.enabled
         if next_value and self.feature == 'uv_show_checker':
             prefs.uv_show_stretch = False
             prefs.uv_show_orientation = False
         elif next_value and self.feature in {'uv_show_stretch', 'uv_show_orientation'}:
             prefs.uv_show_checker = False
-        setattr(prefs, self.feature, next_value)
+        if previous_value != next_value:
+            setattr(prefs, self.feature, next_value)
         visible_meshes = _visible_meshes(context)
         if getattr(prefs, self.feature) and not any(obj.data.uv_layers.active for obj in visible_meshes):
             self.report({'WARNING'}, "场景中可见的模型没有 UV 层")
@@ -332,6 +454,7 @@ class MC_OT_settings_popup(bpy.types.Operator):
         elif self.target == 'UV_BOUNDARIES':
             layout.label(text="UV 分界边")
             layout.prop(prefs, "uv_boundary_color")
+            layout.prop(prefs, "uv_boundary_width", slider=True)
         elif self.target == 'UV_CHECKER':
             layout.label(text="UV 棋盘格")
             layout.prop(prefs, "uv_checker_opacity", slider=True)

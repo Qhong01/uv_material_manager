@@ -19,7 +19,6 @@ _GROUP_MATERIAL_KEY = "_model_checker_material"
 _GROUP_SIGNATURE_KEY = "_model_checker_checker_signature"
 _CHECKER_IMAGE_TAG = "_model_checker_temporary_checker_image"
 _CHECKER_IMAGE_SIGNATURE = "_model_checker_checker_image_signature"
-_CHECKER_IMAGE_SIZE = 1024
 _LEGACY_MESH_KEYS = (
     "_model_checker_stretch_attribute",
     "_model_checker_flipped_attribute",
@@ -341,8 +340,10 @@ def _remove_legacy_preview(obj):
 
 
 def _checker_image(prefs):
+    density = min(max(int(prefs.uv_checker_density), 1), 256)
     signature = repr((
-        int(prefs.uv_checker_density),
+        "lowres-v2",
+        density,
         float(prefs.uv_checker_opacity),
         tuple(prefs.uv_checker_color_a),
         tuple(prefs.uv_checker_color_b),
@@ -351,49 +352,47 @@ def _checker_image(prefs):
         candidate for candidate in bpy.data.images
         if candidate.get(_CHECKER_IMAGE_TAG, False)
     ), None)
+    size = density * 2
     if image is None:
         image = bpy.data.images.new(
             ".Model Checker UV 棋盘格",
-            width=_CHECKER_IMAGE_SIZE,
-            height=_CHECKER_IMAGE_SIZE,
+            width=size,
+            height=size,
             alpha=False,
             float_buffer=False,
         )
         image[_CHECKER_IMAGE_TAG] = True
         image.colorspace_settings.name = 'Non-Color'
+    elif tuple(image.size) != (size, size):
+        image.scale(size, size)
     if image.get(_CHECKER_IMAGE_SIGNATURE, "") == signature:
         return image
 
-    size = _CHECKER_IMAGE_SIZE
-    density = min(max(int(prefs.uv_checker_density), 1), 256)
-    cell_size = size / density
     opacity = min(max(float(prefs.uv_checker_opacity), 0.0), 1.0)
-    color_a = tuple(float(value) for value in prefs.uv_checker_color_a)
-    color_b = tuple(float(value) for value in prefs.uv_checker_color_b)
     background = (0.38, 0.38, 0.38)
+    colors = []
+    for color in (prefs.uv_checker_color_a, prefs.uv_checker_color_b):
+        colors.append(array('f', (
+            *(background[channel] + (float(color[channel]) - background[channel]) * opacity
+              for channel in range(3)),
+            1.0,
+        )))
+
+    even_row = array('f')
+    odd_row = array('f')
+    for cell_x in range(density):
+        even_row.extend(colors[cell_x % 2] * 2)
+        odd_row.extend(colors[(cell_x + 1) % 2] * 2)
+
     pixels = array('f')
-    for y in range(size):
-        row = array('f')
-        cell_y = int(y / cell_size)
-        for x in range(size):
-            color = color_a if (int(x / cell_size) + cell_y) % 2 == 0 else color_b
-            row.extend(
-                background[channel] + (color[channel] - background[channel]) * opacity
-                for channel in range(3)
-            )
-            row.append(1.0)
+    for cell_y in range(density):
+        row = even_row if cell_y % 2 == 0 else odd_row
+        pixels.extend(row)
         pixels.extend(row)
     image.pixels.foreach_set(pixels)
     image.update()
     image[_CHECKER_IMAGE_SIGNATURE] = signature
     return image
-
-
-def checker_preview_image():
-    return next((
-        image for image in bpy.data.images
-        if image.get(_CHECKER_IMAGE_TAG, False)
-    ), None)
 
 
 def _remove_checker_images():
@@ -475,7 +474,7 @@ def _ensure_checker_modifier(obj, uv_name, display_name, prefs):
                 node.inputs['Material'].default_value = material
                 break
     signature = repr((
-        "material-preview-composite-v1",
+        "material-preview-composite-v2-lowres-checker",
         uv_name,
         display_name,
         bool(prefs.uv_show_checker),
@@ -602,6 +601,10 @@ def refresh_timer():
         return None
     prefs = addon.preferences
     active = _feature_enabled(prefs)
+    if not state.uv_display_dirty:
+        if not active:
+            restore_viewport_mode(scene)
+        return None
     visible_objects = set(visible_meshes(scene, context.view_layer)) if active else set()
     visible_mesh_data = {obj.data for obj in visible_objects}
     window = context.window
@@ -609,41 +612,48 @@ def refresh_timer():
         context.mode == 'EDIT_MESH'
         and _edit_transform_active(window)
     )
-    defer_edit_refresh = (
+    defer_preview_refresh = (
         state.uv_display_dirty
-        and context.mode == 'EDIT_MESH'
         and (
-            edit_transform_active
-            or time.monotonic() < state.uv_display_defer_until
+            time.monotonic() < state.uv_display_defer_until
+            or edit_transform_active
         )
     )
-    edit_refresh_pending = False
+    if defer_preview_refresh:
+        return 0.25
+    objects = tuple(scene.objects)
+    start = min(state.uv_refresh_cursor, len(objects))
+    stop = min(start + 8, len(objects))
+    refresh_pending = stop < len(objects)
     state.refresh_in_progress = True
     try:
-        for obj in tuple(scene.objects):
+        for obj in objects[start:stop]:
             if obj.type != 'MESH':
                 continue
             if obj in visible_objects:
-                if defer_edit_refresh and obj.mode == 'EDIT':
-                    edit_refresh_pending = True
-                    continue
                 _ensure_preview(
                     obj,
                     prefs,
-                    force_update=state.uv_display_dirty and not defer_edit_refresh,
+                    force_update=state.uv_display_dirty,
                 )
             elif mesh_has_diagnostic(obj.data) or _legacy_preview_modifier(obj) is not None:
                 _remove_legacy_preview(obj)
                 if obj.data not in visible_mesh_data:
                     _remove_diagnostic_attributes(obj.data)
 
-        if not edit_refresh_pending:
+        if refresh_pending:
+            state.uv_refresh_cursor = stop
+        else:
+            state.uv_refresh_cursor = 0
             state.uv_display_dirty = False
     finally:
         state.refresh_in_progress = False
-    _remove_checker_images()
+    if not refresh_pending:
+        _remove_checker_images()
+    if refresh_pending:
+        return 0.05
     if active:
-        return 0.25
+        return None
     restore_viewport_mode(scene)
     return None
 

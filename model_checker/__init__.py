@@ -11,6 +11,7 @@ bl_info = {
 }
 
 import importlib
+import time
 
 import bpy
 from bpy.props import BoolProperty, EnumProperty, FloatProperty, FloatVectorProperty, IntProperty, PointerProperty, StringProperty
@@ -42,13 +43,27 @@ def _redraw_viewports():
     return None
 
 
+def _save_user_preferences():
+    """Persist the add-on's shared checker settings after the user finishes editing."""
+    try:
+        bpy.ops.wm.save_userpref()
+    except RuntimeError as exc:
+        print(f"UV Material Manager: 无法自动保存首选项：{exc}")
+    return None
+
+
+def _schedule_preferences_save(_self=None, _context=None):
+    if not bpy.app.timers.is_registered(_save_user_preferences):
+        bpy.app.timers.register(_save_user_preferences, first_interval=0.5)
+
+
 def _sync_scene_overlay(scene, prefs):
     if not hasattr(scene, "model_checker_state"):
         return
     scene_state = scene.model_checker_state
     for name in (
         "uv_show_stretch", "uv_show_boundaries", "uv_show_checker",
-        "uv_show_orientation", "uv_boundary_color", "uv_stretch_base_color",
+        "uv_show_orientation", "uv_boundary_color", "uv_boundary_width", "uv_stretch_base_color",
         "uv_stretch_max_color", "uv_stretch_strength", "uv_stretch_threshold",
         "uv_stretch_opacity",
         "uv_checker_opacity", "uv_checker_density", "uv_checker_color_a",
@@ -64,6 +79,7 @@ def _sync_scene_overlay(scene, prefs):
     ))
     scene_state.overlay_cache_dirty = True
     scene_state.uv_display_dirty = True
+    scene_state.uv_refresh_cursor = 0
 
 
 def _sync_all_scenes(prefs):
@@ -87,6 +103,14 @@ def _update_scene_overlay(self, context):
         return
     _enforce_uv_display_exclusivity(self)
     _sync_all_scenes(self)
+    refresh_after_adjustment = time.monotonic() + 0.25
+    for scene in bpy.data.scenes:
+        if hasattr(scene, "model_checker_state"):
+            state = scene.model_checker_state
+            state.uv_display_defer_until = max(
+                state.uv_display_defer_until,
+                refresh_after_adjustment,
+            )
     show_diagnostics = any((
         self.uv_show_stretch,
         self.uv_show_checker,
@@ -97,6 +121,35 @@ def _update_scene_overlay(self, context):
     if not bpy.app.timers.is_registered(_redraw_viewports):
         bpy.app.timers.register(_redraw_viewports, first_interval=0.1)
     diagnostic.start_refresh_timer()
+    _schedule_preferences_save()
+
+
+def _update_checker_settings(self, context):
+    deadline = time.monotonic() + 0.4
+    for scene in bpy.data.scenes:
+        if not hasattr(scene, "model_checker_state"):
+            continue
+        state = scene.model_checker_state
+        for name in (
+            "uv_checker_opacity", "uv_checker_density",
+            "uv_checker_color_a", "uv_checker_color_b",
+        ):
+            setattr(state, name, getattr(self, name))
+        state.uv_display_dirty = True
+        state.uv_refresh_cursor = 0
+        if self.uv_show_checker:
+            state.uv_display_defer_until = max(state.uv_display_defer_until, deadline)
+    diagnostic.start_refresh_timer()
+    _schedule_preferences_save()
+
+
+def _update_boundary_width(self, context):
+    for scene in bpy.data.scenes:
+        if hasattr(scene, "model_checker_state"):
+            scene.model_checker_state.uv_boundary_width = self.uv_boundary_width
+    if not bpy.app.timers.is_registered(_redraw_viewports):
+        bpy.app.timers.register(_redraw_viewports, first_interval=0.1)
+    _schedule_preferences_save()
 
 
 @persistent
@@ -125,6 +178,7 @@ def _disable_checker_before_lifecycle_change(_dummy):
         state = scene.model_checker_state
         state.uv_show_checker = False
         state.uv_display_dirty = True
+        state.uv_refresh_cursor = 0
         state.overlay_cache_dirty = True
         remaining = any((state.uv_show_stretch, state.uv_show_orientation))
         diagnostic.sync_viewport_mode(scene, remaining, 'VERTEX')
@@ -137,6 +191,7 @@ class MC_PG_scene_state(bpy.types.PropertyGroup):
     overlay_cache_dirty: BoolProperty(default=True, options={'SKIP_SAVE'})
     uv_display_dirty: BoolProperty(default=True, options={'SKIP_SAVE'})
     uv_display_defer_until: FloatProperty(default=0.0, options={'SKIP_SAVE'})
+    uv_refresh_cursor: IntProperty(default=0, options={'SKIP_SAVE'})
     refresh_in_progress: BoolProperty(default=False, options={'SKIP_SAVE'})
     uv_show_stretch: BoolProperty(default=False, options={'SKIP_SAVE'})
     uv_stretch_opacity: FloatProperty(default=0.85, min=0.0, max=1.0, options={'SKIP_SAVE'})
@@ -146,6 +201,7 @@ class MC_PG_scene_state(bpy.types.PropertyGroup):
     uv_stretch_threshold: FloatProperty(default=0.0, min=0.0, max=0.999, subtype='PERCENTAGE', options={'SKIP_SAVE'})
     uv_show_boundaries: BoolProperty(default=False, options={'SKIP_SAVE'})
     uv_boundary_color: FloatVectorProperty(size=3, subtype='COLOR', default=(1.0, 0.55, 0.08), min=0.0, max=1.0, options={'SKIP_SAVE'})
+    uv_boundary_width: FloatProperty(default=4.0, min=1.0, max=12.0, options={'SKIP_SAVE'})
     uv_show_checker: BoolProperty(default=False, options={'SKIP_SAVE'})
     uv_checker_opacity: FloatProperty(default=0.75, min=0.0, max=1.0, options={'SKIP_SAVE'})
     uv_checker_density: IntProperty(default=8, min=1, max=256, options={'SKIP_SAVE'})
@@ -195,11 +251,12 @@ class MC_AddonPreferences(bpy.types.AddonPreferences):
     uv_stretch_threshold: FloatProperty(name="可接受拉伸阈值", description="低于此阈值的拉伸按无拉伸颜色显示", default=0.0, min=0.0, max=0.999, subtype='PERCENTAGE', update=_update_scene_overlay)
     uv_show_boundaries: BoolProperty(name="显示 UV 分界边", default=False, update=_update_scene_overlay)
     uv_boundary_color: FloatVectorProperty(name="边界颜色", subtype='COLOR', size=3, default=(1.0, 0.55, 0.08), min=0.0, max=1.0, update=_update_scene_overlay)
+    uv_boundary_width: FloatProperty(name="分界线粗细", default=4.0, min=1.0, max=12.0, update=_update_boundary_width)
     uv_show_checker: BoolProperty(name="显示棋盘格", default=False, update=_update_scene_overlay)
-    uv_checker_opacity: FloatProperty(name="棋盘格透明度", default=0.75, min=0.0, max=1.0, update=_update_scene_overlay)
-    uv_checker_density: IntProperty(name="棋盘格密度", default=8, min=1, max=256, update=_update_scene_overlay)
-    uv_checker_color_a: FloatVectorProperty(name="棋盘格颜色 A", subtype='COLOR', size=3, default=(0.95, 0.95, 0.95), min=0.0, max=1.0, update=_update_scene_overlay)
-    uv_checker_color_b: FloatVectorProperty(name="棋盘格颜色 B", subtype='COLOR', size=3, default=(0.12, 0.12, 0.12), min=0.0, max=1.0, update=_update_scene_overlay)
+    uv_checker_opacity: FloatProperty(name="棋盘格透明度", default=0.75, min=0.0, max=1.0, update=_update_checker_settings)
+    uv_checker_density: IntProperty(name="棋盘格密度", default=8, min=1, max=256, update=_update_checker_settings)
+    uv_checker_color_a: FloatVectorProperty(name="棋盘格颜色 A", subtype='COLOR', size=3, default=(0.95, 0.95, 0.95), min=0.0, max=1.0, update=_update_checker_settings)
+    uv_checker_color_b: FloatVectorProperty(name="棋盘格颜色 B", subtype='COLOR', size=3, default=(0.12, 0.12, 0.12), min=0.0, max=1.0, update=_update_checker_settings)
     uv_show_orientation: BoolProperty(name="显示 UV 正反", default=False, update=_update_scene_overlay)
     uv_orientation_opacity: FloatProperty(name="UV 正反透明度", default=0.9, min=0.0, max=1.0, update=_update_scene_overlay)
     uv_orientation_front_color: FloatVectorProperty(name="正向颜色", subtype='COLOR', size=3, default=(0.43, 0.78, 1.0), min=0.0, max=1.0, update=_update_scene_overlay)
@@ -223,6 +280,7 @@ class MC_AddonPreferences(bpy.types.AddonPreferences):
         layout.prop(self, "uv_stretch_strength", slider=True)
         layout.prop(self, "uv_stretch_threshold", slider=True)
         layout.prop(self, "uv_boundary_color")
+        layout.prop(self, "uv_boundary_width", slider=True)
         layout.prop(self, "uv_checker_opacity", slider=True)
         layout.prop(self, "uv_checker_density")
         layout.prop(self, "uv_checker_color_a")
@@ -315,35 +373,6 @@ def migrate_preferences():
     addon_utils.disable("Model_Checker", default_set=True)
 
 
-def draw_preferences(layout, prefs):
-    """Draw settings formerly hosted by the independent Model Checker add-on."""
-    layout.label(text="模型检查")
-    layout.label(text="多边面")
-    row = layout.row()
-    row.label(text="边数大于")
-    row.prop(prefs, "ngon_sides", text="")
-    layout.prop(prefs, "ngon_clear_selection")
-    layout.separator()
-    layout.label(text="UV 显示")
-    layout.prop(prefs, "uv_stretch_opacity", slider=True)
-    layout.prop(prefs, "uv_stretch_base_color")
-    layout.prop(prefs, "uv_stretch_max_color")
-    layout.prop(prefs, "uv_stretch_strength", slider=True)
-    layout.prop(prefs, "uv_stretch_threshold", slider=True)
-    layout.prop(prefs, "uv_boundary_color")
-    layout.prop(prefs, "uv_checker_opacity", slider=True)
-    layout.prop(prefs, "uv_checker_density")
-    layout.prop(prefs, "uv_checker_color_a")
-    layout.prop(prefs, "uv_checker_color_b")
-    layout.prop(prefs, "uv_orientation_opacity", slider=True)
-    layout.prop(prefs, "uv_orientation_front_color")
-    layout.prop(prefs, "uv_orientation_back_color")
-    layout.separator()
-    layout.label(text="孤立顶点")
-    layout.prop(prefs, "isolated_include_hidden")
-    layout.prop(prefs, "isolated_clear_selection")
-
-
 def _initialize_after_register():
     """Apply scene settings after Blender leaves its restricted register phase."""
     _migrate_overlay_opacity_defaults()
@@ -383,6 +412,8 @@ def register():
 def unregister():
     if bpy.app.timers.is_registered(migrate_preferences):
         bpy.app.timers.unregister(migrate_preferences)
+    if bpy.app.timers.is_registered(_save_user_preferences):
+        bpy.app.timers.unregister(_save_user_preferences)
     addon = bpy.context.preferences.addons.get(ADDON_ID)
     if addon is not None and addon.preferences.uv_show_checker:
         addon.preferences.uv_show_checker = False

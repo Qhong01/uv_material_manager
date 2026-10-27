@@ -24,6 +24,7 @@ class VIEW3D_PT_ModelChecker(bpy.types.Panel):
         )
         for label, operator_id, feature, settings_target in features:
             row = grid.row(align=True)
+            row.operator_context = 'INVOKE_DEFAULT'
             if feature is None:
                 row.operator(operator_id, text=label)
             else:

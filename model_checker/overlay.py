@@ -95,15 +95,16 @@ def _draw_overlay():
         if obj.type == 'MESH' and obj.visible_get(view_layer=context.view_layer)
     )
     scene_key = context.scene.as_pointer()
-    signature = _overlay_signature(context.mode, objects, state)
+    signature = None
     cached = _DRAW_CACHE.get(scene_key)
-    if cached is None or state.overlay_cache_dirty or cached[0] != signature:
+    if cached is None or state.overlay_cache_dirty:
         window = context.window
         modal_active = _edit_transform_active(window)
         if modal_active:
             if cached is None:
                 return
         else:
+            signature = _overlay_signature(context.mode, objects, state)
             cached = _build_overlay_batches(objects, state, signature)
             _DRAW_CACHE[scene_key] = cached
             state.overlay_cache_dirty = False
@@ -117,7 +118,7 @@ def _draw_overlay():
             gpu.state.blend_set('ALPHA')
             line_shader.bind()
             line_shader.uniform_float("viewportSize", gpu.state.viewport_get()[2:])
-            line_shader.uniform_float("lineWidth", 4.0)
+            line_shader.uniform_float("lineWidth", state.uv_boundary_width)
             line_shader.uniform_float("color", (*state.uv_boundary_color, 1.0))
             line_batch.draw(line_shader)
     finally:
@@ -180,8 +181,11 @@ def _invalidate_overlay_cache(scene, depsgraph):
             continue
         state.overlay_cache_dirty = True
         state.uv_display_dirty = True
+        state.uv_refresh_cursor = 0
         if bpy.context.mode == 'EDIT_MESH':
             state.uv_display_defer_until = time.monotonic() + 0.6
+        from . import diagnostic
+        diagnostic.start_refresh_timer()
         return
 
 
