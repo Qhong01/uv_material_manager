@@ -72,24 +72,8 @@ EXISTING_IDS = {
     'view3d.uvmm_restore_hidden_level',
 }
 
-# Display name / icon for the keymap contexts used above.
-KEYMAP_INFO = {
-    '3D View': ('3D 视图', 'VIEW3D'),
-    'Mesh': ('网格', 'MESH_DATA'),
-    'Object Mode': ('物体模式', 'OBJECT_DATA'),
-    'Screen': ('屏幕', 'WINDOW'),
-}
-
 # Indentation in pixels, matching the native keymap editor's 16 px steps.
 _INDENT_PX = 18.0
-
-
-def _keymap_label(name):
-    return KEYMAP_INFO.get(name, (name, 'NONE'))[0]
-
-
-def _keymap_icon(name):
-    return KEYMAP_INFO.get(name, (name, 'NONE'))[1]
 
 
 def _indented(layout, context, level):
@@ -167,7 +151,7 @@ def _ensure_item(window_manager, spec, allow_unassigned=False,
         if not allow_unassigned:
             return
         key = 'NONE'
-    if _spec_key(spec) in _removed_keys(context):
+    if not _is_layout_spec(spec) and _spec_key(spec) in _removed_keys(context):
         return
     user = window_manager.keyconfigs.user
     addon = window_manager.keyconfigs.addon
@@ -201,7 +185,7 @@ def _layout_spec(item, index, key='NONE', modifiers=None):
             key, modifiers or {}, properties)
 
 
-def _ensure_layout_items(wm, items):
+def _ensure_layout_items(wm, items, use_user_keymap=False):
     seen_types = set()
     for index, item in enumerate(items):
         editor_type = _layout_field(item, 'editor_type')
@@ -209,7 +193,8 @@ def _ensure_layout_items(wm, items):
         if editor_type in seen_types:
             key, modifiers = 'NONE', {}
         seen_types.add(editor_type)
-        _ensure_item(wm, _layout_spec(item, index, key, modifiers))
+        _ensure_item(wm, _layout_spec(item, index, key, modifiers),
+                     use_user_keymap=use_user_keymap)
 
 
 def ensure_layout_shortcuts(scene):
@@ -217,19 +202,100 @@ def ensure_layout_shortcuts(scene):
     wm = bpy.context.window_manager
     if wm is None:
         return
-    _ensure_layout_items(wm, scene.um_custom_layouts)
+    _ensure_layout_items(wm, scene.um_custom_layouts, use_user_keymap=True)
     wm.keyconfigs.update()
 
 
-def _draw_keymap_header(layout, context, name):
-    """Small section title that mirrors the native "屏幕 (全局)" child header."""
-    row = _indented(layout, context, 0.8).row(align=True)
-    row.label(text=_keymap_label(name), icon=_keymap_icon(name))
+def ensure_layout_item_shortcut(scene, item_id):
+    """Give a freshly added layout a row whose key can be assigned right away."""
+    wm = bpy.context.window_manager
+    if wm is None:
+        return
+    for index, item in enumerate(scene.um_custom_layouts):
+        if item.id != item_id:
+            continue
+        spec = _layout_spec(item, index)
+        if _matching_item(wm.keyconfigs.user, 'Screen', spec[2], spec[5])[1] is None:
+            _ensure_item(wm, spec, allow_unassigned=True, use_user_keymap=True)
+        wm.keyconfigs.update()
+        return
 
 
-def _draw_shortcut(layout, context, spec, level=2.0):
+_LAYOUT_OP_PREFIX = 'screen.toggle_custom_layout'
+
+
+def _is_layout_spec(spec):
+    return spec[1] == 'Screen' and spec[2].startswith(_LAYOUT_OP_PREFIX)
+
+
+def _binding_of(kmi):
+    modifiers = {name: True for name in ('ctrl', 'shift', 'alt', 'oskey')
+                 if getattr(kmi, name)}
+    return kmi.type, modifiers, kmi.active
+
+
+def capture_layout_bindings(scene):
+    """Snapshot each layout's shortcut by item id before the list is edited."""
+    wm = bpy.context.window_manager
+    user = wm.keyconfigs.user if wm else None
+    if user is None or scene is None:
+        return {}
+    bindings = {}
+    for index, item in enumerate(scene.um_custom_layouts):
+        spec = _layout_spec(item, index)
+        _, kmi = _matching_item(user, 'Screen', spec[2], spec[5])
+        if kmi is not None:
+            bindings[item.id] = _binding_of(kmi)
+    return bindings
+
+
+def rebuild_layout_shortcuts(scene, bindings):
+    """Recreate slot bindings so every shortcut follows its layout item."""
+    wm = bpy.context.window_manager
+    user = wm.keyconfigs.user if wm else None
+    if user is None or scene is None:
+        return
+    km = user.keymaps.get('Screen')
+    if km is None:
+        return
+    for kmi in list(km.keymap_items):
+        if kmi.idname.startswith(_LAYOUT_OP_PREFIX):
+            km.keymap_items.remove(kmi)
+    for index, item in enumerate(scene.um_custom_layouts):
+        binding = bindings.get(item.id)
+        if binding is None:
+            continue
+        key, modifiers, active = binding
+        spec = _layout_spec(item, index, key, modifiers)
+        _ensure_item(wm, spec, allow_unassigned=True, use_user_keymap=True)
+        _, kmi = _matching_item(user, 'Screen', spec[2], spec[5])
+        if kmi is not None:
+            kmi.active = active
+    wm.keyconfigs.update()
+
+
+def _draw_layout_meta(row, item, index):
+    """Name / direction / ratio / delete, drawn inside the shortcut row."""
+    row.prop(item, 'name', text='')
+    row.prop(item, 'direction', text='')
+    row.prop(item, 'ratio', text='', slider=True)
+    remove = row.operator('workspace.remove_custom_layout', text='', icon='TRASH')
+    remove.index = index
+
+
+def _draw_layout_add_row(layout, context, count):
+    split = _indented(layout, context, 1.0).split(factor=0.17)
+    split.menu('WORKSPACE_MT_add_custom_layout_menu', text='添加新项', icon='ADD')
+    tail = split.row()
+    tail.alignment = 'RIGHT'
+    tail.label(text=f'共 {count} 项')
+
+
+def _draw_shortcut(layout, context, spec, level=2.0, layout_item=None,
+                   layout_index=0):
     label, name, operator_id, key, modifiers, properties = spec
-    removed = _spec_key(spec) in _removed_keys(context)
+    removed = (not _is_layout_spec(spec)
+               and _spec_key(spec) in _removed_keys(context))
     km, kmi = None, None
     if not removed:
         configs = context.window_manager.keyconfigs
@@ -240,6 +306,25 @@ def _draw_shortcut(layout, context, spec, level=2.0):
     col = _indented(layout, context, level)
 
     if kmi is None:
+        if layout_item is not None:
+            split = col.split()
+            left = split.row(align=True)
+            left.label(text='', icon='BLANK1')
+            left.label(text='', icon='BLANK1')
+            _draw_layout_meta(left, layout_item, layout_index)
+            right = split.row()
+            right.alignment = 'RIGHT'
+            add = right.operator('uvmm.add_shortcut', text='添加快捷键', icon='ADD')
+            add.keymap_name = name
+            add.operator_id = operator_id
+            add.item_id = properties.get('item_id', '')
+            add.panel_name = properties.get('name', '')
+            add.key = key
+            add.ctrl = bool(modifiers.get('ctrl'))
+            add.shift = bool(modifiers.get('shift'))
+            add.alt = bool(modifiers.get('alt'))
+            add.oskey = bool(modifiers.get('oskey'))
+            return
         row = col.row(align=True)
         row.separator(factor=2.2)
         row.label(text=label)
@@ -262,11 +347,15 @@ def _draw_shortcut(layout, context, spec, level=2.0):
     else:
         split = col.split()
 
-    # Left half: expansion arrow, enable checkbox, name - the native widgets.
+    # Left half: expansion arrow, enable checkbox, then either the shortcut
+    # label or the inline split-view fields.
     head = split.row(align=True)
     head.prop(kmi, 'show_expanded', text='', emboss=False)
     head.prop(kmi, 'active', text='', emboss=False)
-    head.label(text=label)
+    if layout_item is not None:
+        _draw_layout_meta(head, layout_item, layout_index)
+    else:
+        head.label(text=label)
 
     # Right half: keymap type ("键盘"), key binding, remove button.
     right = split.row()
@@ -330,16 +419,12 @@ def _keymap_buckets(specs):
 
 
 def _draw_group(layout, context, specs):
-    buckets = _keymap_buckets(specs)
-    # One indent level per keymap section, exactly like the native editor's
-    # "Global" child section. Rows always use the same level so the "键盘",
-    # key and close columns line up across every group.
-    with_headers = len(buckets) > 1
-    for name, group_specs in buckets:
-        if with_headers:
-            _draw_keymap_header(layout, context, name)
+    # Keep the keymap grouping only as an ordering hint; the panels themselves
+    # are the hierarchy. All rows share one indent level so the "键盘", key and
+    # close columns line up across every group.
+    for _name, group_specs in _keymap_buckets(specs):
         for spec in group_specs:
-            _draw_shortcut(layout, context, spec, 2.0)
+            _draw_shortcut(layout, context, spec, 1.0)
 
 
 class UVMM_OT_AddShortcut(Operator):
@@ -397,8 +482,10 @@ class UVMM_OT_RemoveShortcut(Operator):
         if kmi is None:
             return {'CANCELLED'}
         km.keymap_items.remove(kmi)
-        _set_removed(context, ('', self.keymap_name, self.operator_id,
-                               'NONE', {}, properties), True)
+        if not _is_layout_spec(('', self.keymap_name, self.operator_id,
+                                'NONE', {}, properties)):
+            _set_removed(context, ('', self.keymap_name, self.operator_id,
+                                   'NONE', {}, properties), True)
         preferences = getattr(context, 'preferences', None)
         if preferences is not None:
             preferences.is_dirty = True
@@ -426,9 +513,18 @@ def draw_shortcut_preferences(layout, context):
             _draw_group(body, context, specs)
             continue
         scene = context.scene
-        items = getattr(scene, 'um_custom_layouts', None) if scene else None
-        if items is None:
-            items = workspace.load_json_config()
+        has_layouts = scene is not None and hasattr(scene, 'um_custom_layouts')
+        if has_layouts:
+            items = scene.um_custom_layouts
+            _draw_layout_add_row(body, context, len(items))
+            if not items:
+                body.label(text='尚未添加分屏项目，点击「添加新项」开始配置', icon='INFO')
+                continue
+            for index, item in enumerate(items):
+                _draw_shortcut(body, context, _layout_spec(item, index), 1.0,
+                               layout_item=item, layout_index=index)
+            continue
+        items = workspace.load_json_config()
         if not items:
             body.label(text='尚未添加分屏项目', icon='INFO')
             continue
@@ -461,7 +557,7 @@ def register():
         for spec in group:
             if spec[2] not in EXISTING_IDS:
                 _ensure_item(wm, spec)
-    _ensure_layout_items(wm, workspace.load_json_config())
+    _ensure_layout_items(wm, workspace.load_json_config(), use_user_keymap=True)
     wm.keyconfigs.update()
 
 

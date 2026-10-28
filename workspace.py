@@ -1167,6 +1167,7 @@ class WORKSPACE_OT_AddCustomLayoutItem(Operator):
         save_scene_layouts_to_json(scene)
         from . import shortcut_panel
         shortcut_panel.ensure_layout_shortcuts(scene)
+        shortcut_panel.ensure_layout_item_shortcut(scene, new_item.id)
         scene.um_show_layout_settings = True
         self.report({'INFO'}, f"已添加: {new_item.name}")
         return {'FINISHED'}
@@ -1196,11 +1197,15 @@ class WORKSPACE_OT_RemoveCustomLayoutItem(Operator):
         wm = context.window_manager
 
         if 0 <= self.index < len(scene.um_custom_layouts):
+            from . import shortcut_panel
+            bindings = shortcut_panel.capture_layout_bindings(scene)
             item = scene.um_custom_layouts[self.index]
             if getattr(wm, "um_active_layout_id", "") == item.id:
                 close_secondary_area(context)
             scene.um_custom_layouts.remove(self.index)
             save_scene_layouts_to_json(scene)
+            # Keep every remaining shortcut attached to its own layout.
+            shortcut_panel.rebuild_layout_shortcuts(scene, bindings)
             self.report({'INFO'}, "已删除视图")
             return {'FINISHED'}
 

@@ -118,6 +118,23 @@ class UVMM_AddonPreferences(AddonPreferences):
     uv_checker_density: IntProperty(name="棋盘格密度", default=8, min=1, max=256, update=model_checker._update_checker_settings)
     uv_checker_color_a: FloatVectorProperty(name="棋盘格颜色 A", subtype='COLOR', size=3, default=(0.95, 0.95, 0.95), min=0.0, max=1.0, update=model_checker._update_checker_settings)
     uv_checker_color_b: FloatVectorProperty(name="棋盘格颜色 B", subtype='COLOR', size=3, default=(0.12, 0.12, 0.12), min=0.0, max=1.0, update=model_checker._update_checker_settings)
+    uv_checker_pattern: EnumProperty(
+        name="棋盘格图案",
+        description="棋盘格的图案来源",
+        items=model_checker.diagnostic.CHECKER_PATTERN_ITEMS,
+        default='CLASSIC',
+        update=model_checker._update_checker_pattern,
+    )
+    uv_checker_custom_image: StringProperty(
+        name="自定义棋盘格图片",
+        description="选择作为棋盘格的图片（会按 UV 范围平铺）",
+        subtype='FILE_PATH',
+        default="",
+        update=model_checker._update_checker_pattern,
+    )
+    uv_checker_density_map: StringProperty(default="", options={'HIDDEN'})
+    uv_checker_density_key: StringProperty(default="", options={'HIDDEN'})
+    uv_checker_density_switching: BoolProperty(default=False, options={'HIDDEN', 'SKIP_SAVE'})
     uv_show_orientation: BoolProperty(name="显示 UV 正反", default=False, update=model_checker._update_scene_overlay)
     uv_orientation_opacity: FloatProperty(name="UV 正反透明度", default=0.9, min=0.0, max=1.0, update=model_checker._update_scene_overlay)
     uv_orientation_front_color: FloatVectorProperty(name="正向颜色", subtype='COLOR', size=3, default=(0.43, 0.78, 1.0), min=0.0, max=1.0, update=model_checker._update_scene_overlay)

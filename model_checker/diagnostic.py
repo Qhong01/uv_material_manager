@@ -4,6 +4,7 @@ import hashlib
 import math
 import time
 from array import array
+from pathlib import Path
 
 import bpy
 import bmesh
@@ -28,6 +29,21 @@ _GROUP_MATERIAL_KEY = "_model_checker_material"
 _GROUP_SIGNATURE_KEY = "_model_checker_checker_signature"
 _CHECKER_IMAGE_TAG = "_model_checker_temporary_checker_image"
 _CHECKER_IMAGE_SIGNATURE = "_model_checker_checker_image_signature"
+_CHECKER_FILE_IMAGE_TAG = "_model_checker_file_checker_image"
+_CHECKER_FILE_IMAGE_PATH = "_model_checker_file_checker_path"
+_CHECKER_BAKED_TAG = "_model_checker_baked_checker_image"
+_CHECKER_BAKED_SIGNATURE = "_model_checker_baked_checker_signature"
+_CHECKER_BAKE_SIZE = 2048
+_CHECKER_TEXTURE_NODE = "Checker Texture"
+_CHECKER_MIX_NODE = "Checker Opacity Mix"
+_CHECKER_MATERIAL_LAYOUT = "_model_checker_checker_material_layout"
+_CHECKER_MATERIAL_LAYOUT_VERSION = "v5"
+_DIRECTION_CHECKER_PATH = Path(__file__).resolve().parent.parent / 'textures' / 'uv_checker_direction.png'
+CHECKER_PATTERN_ITEMS = (
+    ('CLASSIC', "经典棋盘", "按密度与 A/B 颜色生成的棋盘格"),
+    ('DIRECTION', "方向检查", "带 A0-H7 编号与方向箭头的方向检查图"),
+    ('CUSTOM', "自定义图片", "使用自定义图片作为棋盘格（在 UV 0-1 范围内平铺）"),
+)
 _LEGACY_MESH_KEYS = (
     "_model_checker_stretch_attribute",
     "_model_checker_flipped_attribute",
@@ -510,14 +526,10 @@ def _remove_legacy_preview(obj):
     modifier = _legacy_preview_modifier(obj)
     if modifier is None:
         return
-    group = modifier.node_group
-    material_name = group.get("_model_checker_material", "") if group is not None else ""
-    material = bpy.data.materials.get(material_name)
+    # Keep the node group / material alive: Blender's undo memfiles can still
+    # reference them after the modifier is removed, and freeing them here makes
+    # undo decode crash (modifier ID-link on a freed node tree).
     obj.modifiers.remove(modifier)
-    if group is not None and group.users == 0:
-        bpy.data.node_groups.remove(group)
-    if material is not None and material.users == 0:
-        bpy.data.materials.remove(material)
 
 
 def _checker_image(prefs):
@@ -576,10 +588,148 @@ def _checker_image(prefs):
     return image
 
 
+def _resolved_checker_path(path_value):
+    if not path_value:
+        return None
+    resolved = Path(bpy.path.abspath(path_value))
+    return resolved if resolved.is_file() else None
+
+
+def checker_custom_image_available(settings):
+    """True when the custom checker path is usable (or not selected)."""
+    if getattr(settings, 'uv_checker_pattern', 'CLASSIC') != 'CUSTOM':
+        return True
+    return _resolved_checker_path(getattr(settings, 'uv_checker_custom_image', '')) is not None
+
+
+def _file_checker_image(path_value):
+    resolved = _resolved_checker_path(path_value)
+    if resolved is None:
+        return None
+    filepath = str(resolved)
+    for image in bpy.data.images:
+        if (image.get(_CHECKER_FILE_IMAGE_TAG, False)
+                and image.get(_CHECKER_FILE_IMAGE_PATH, "") == filepath):
+            return image
+    try:
+        image = bpy.data.images.load(filepath, check_existing=False)
+    except RuntimeError:
+        return None
+    image[_CHECKER_FILE_IMAGE_TAG] = True
+    image[_CHECKER_FILE_IMAGE_PATH] = filepath
+    image.colorspace_settings.name = 'sRGB'
+    return image
+
+
+def _read_image_pixels(image):
+    width, height = image.size
+    buffer = np.empty(width * height * 4, dtype=np.float32)
+    image.pixels.foreach_get(buffer)
+    return buffer.reshape(height, width, 4)
+
+
+def _scaled_image_pixels(image, size, colorspace):
+    """Return a ``size x size`` float RGBA array using Blender's own scaling."""
+    temp = image.copy()
+    try:
+        temp.colorspace_settings.name = colorspace
+        temp.scale(size, size)
+        return _read_image_pixels(temp)
+    finally:
+        bpy.data.images.remove(temp)
+
+
+def _baked_checker_image(source, density, opacity):
+    """Tile the source image by density so Solid/Texture shows it correctly.
+
+    ``density / 8`` is the number of UV repeats; for non-integer values the
+    last repeat is cropped, exactly like the checker's density semantics. The
+    opacity is baked into the pixels (Solid/Texture ignores material nodes).
+    """
+    size = _CHECKER_BAKE_SIZE
+    repeat = min(max(int(density), 1), 256) / 8.0
+    opacity = min(max(float(opacity), 0.0), 1.0)
+    colorspace = source.colorspace_settings.name
+    signature = repr((source.filepath, density, opacity, colorspace, size))
+    baked = next((
+        image for image in bpy.data.images
+        if image.get(_CHECKER_BAKED_TAG, False)
+    ), None)
+    if baked is not None and baked.get(_CHECKER_BAKED_SIGNATURE, "") == signature:
+        return baked
+    if baked is None:
+        baked = bpy.data.images.new(
+            ".Model Checker UV 图像棋盘格",
+            width=size, height=size, alpha=False, float_buffer=False,
+        )
+        baked[_CHECKER_BAKED_TAG] = True
+    elif tuple(baked.size) != (size, size):
+        baked.scale(size, size)
+    baked.colorspace_settings.name = colorspace
+
+    if repeat >= 1.0:
+        tile_size = max(1, int(round(size / repeat)))
+        tile = _scaled_image_pixels(source, tile_size, colorspace)
+        tiles = int(math.ceil(size / tile_size))
+        pixels = np.tile(tile, (tiles, tiles, 1))[:size, :size]
+    else:
+        # Density 1-7 zooms into the centre of the image (fewer cells).
+        source_pixels = _read_image_pixels(source)
+        height, width = source_pixels.shape[:2]
+        crop = max(1, int(round(min(width, height) * repeat)))
+        x0 = (width - crop) // 2
+        y0 = (height - crop) // 2
+        crop_pixels = np.ascontiguousarray(
+            source_pixels[y0:y0 + crop, x0:x0 + crop])
+        temp = bpy.data.images.new(
+            ".Model Checker UV 裁剪", width=crop, height=crop,
+            alpha=False, float_buffer=False)
+        try:
+            temp.colorspace_settings.name = colorspace
+            temp.pixels.foreach_set(crop_pixels.ravel())
+            temp.scale(size, size)
+            pixels = _read_image_pixels(temp)
+        finally:
+            bpy.data.images.remove(temp)
+
+    pixels = np.ascontiguousarray(pixels, dtype=np.float32)
+    background = 0.38
+    pixels[..., :3] = background + (pixels[..., :3] - background) * opacity
+    baked.pixels.foreach_set(pixels.ravel())
+    baked.update()
+    baked[_CHECKER_BAKED_SIGNATURE] = signature
+    return baked
+
+
+def _checker_interpolation(settings):
+    return 'Closest' if getattr(settings, 'uv_checker_pattern', 'CLASSIC') == 'CLASSIC' else 'Linear'
+
+
+def _checker_texture(settings):
+    """Return ``(image, opacity_is_baked_into_pixels)`` for the active pattern."""
+    pattern = getattr(settings, 'uv_checker_pattern', 'CLASSIC')
+    density = min(max(int(settings.uv_checker_density), 1), 256)
+    opacity = min(max(float(settings.uv_checker_opacity), 0.0), 1.0)
+    if pattern == 'DIRECTION':
+        source = _file_checker_image(str(_DIRECTION_CHECKER_PATH))
+        if source is not None:
+            return _baked_checker_image(source, density, opacity), True
+    elif pattern == 'CUSTOM':
+        source = _file_checker_image(getattr(settings, 'uv_checker_custom_image', ''))
+        if source is not None:
+            return _baked_checker_image(source, density, opacity), True
+    # Missing custom/direction file: fall back to the generated checker so the
+    # preview never goes blank.
+    return _checker_image(settings), True
+
+
 def _remove_checker_images():
-    for image in tuple(bpy.data.images):
-        if image.get(_CHECKER_IMAGE_TAG, False) and image.users == 0:
-            bpy.data.images.remove(image)
+    """Keep checker images for the session (undo memfiles may reference them).
+
+    Orphan datablocks are not written to the .blend, and reusing the tagged
+    datablocks keeps memory bounded while avoiding freed-ID crashes on undo.
+    """
+    return
 
 
 def _build_checker_material(material, uv_name, display_name, prefs):
@@ -593,9 +743,11 @@ def _build_checker_material(material, uv_name, display_name, prefs):
 
     surface_color = None
     if prefs.uv_show_checker:
+        image, opacity_baked = _checker_texture(prefs)
         texture = nodes.new('ShaderNodeTexImage')
-        texture.image = _checker_image(prefs)
-        texture.interpolation = 'Closest'
+        texture.name = _CHECKER_TEXTURE_NODE
+        texture.image = image
+        texture.interpolation = _checker_interpolation(prefs)
         texture.extension = 'REPEAT'
         texture.select = True
         nodes.active = texture
@@ -603,7 +755,16 @@ def _build_checker_material(material, uv_name, display_name, prefs):
             uv_map = nodes.new('ShaderNodeUVMap')
             uv_map.uv_map = uv_name
             links.new(uv_map.outputs['UV'], texture.inputs['Vector'])
-        surface_color = texture.outputs['Color']
+        # The opacity mix is part of the base layout: keeping it means a
+        # pattern switch only updates values instead of rebuilding the tree.
+        mix = nodes.new('ShaderNodeMixRGB')
+        mix.name = _CHECKER_MIX_NODE
+        mix.blend_type = 'MIX'
+        mix.inputs['Color1'].default_value = (0.38, 0.38, 0.38, 1.0)
+        mix.inputs['Fac'].default_value = (0.0 if opacity_baked
+                                          else min(max(float(prefs.uv_checker_opacity), 0.0), 1.0))
+        links.new(texture.outputs['Color'], mix.inputs['Color2'])
+        surface_color = mix.outputs['Color']
 
     if display_name and (prefs.uv_show_stretch or prefs.uv_show_orientation):
         diagnostic_color = nodes.new('ShaderNodeVertexColor')
@@ -621,10 +782,59 @@ def _build_checker_material(material, uv_name, display_name, prefs):
     if surface_color is not None:
         links.new(surface_color, principled.inputs['Base Color'])
     links.new(principled.outputs['BSDF'], output.inputs['Surface'])
+    material[_CHECKER_MATERIAL_LAYOUT] = _CHECKER_MATERIAL_LAYOUT_VERSION
+
+
+def _update_checker_material(material, prefs):
+    """Switch the checker texture in place, without touching node topology."""
+    if material.get(_CHECKER_MATERIAL_LAYOUT, "") != _CHECKER_MATERIAL_LAYOUT_VERSION:
+        return False
+    tree = material.node_tree
+    texture = tree.nodes.get(_CHECKER_TEXTURE_NODE)
+    mix = tree.nodes.get(_CHECKER_MIX_NODE)
+    if texture is None or mix is None:
+        return False
+    image, opacity_baked = _checker_texture(prefs)
+    texture.image = image
+    texture.interpolation = _checker_interpolation(prefs)
+    texture.extension = 'REPEAT'
+    mix.inputs['Fac'].default_value = (0.0 if opacity_baked
+                                      else min(max(float(prefs.uv_checker_opacity), 0.0), 1.0))
+    return True
 
 
 _SHARED_CHECKER_GROUP = ".Model Checker UV - Checker"
 _SHARED_CHECKER_MATERIAL = ".Model Checker UV - Checker"
+
+
+def _checker_signature(settings):
+    pattern = getattr(settings, 'uv_checker_pattern', 'CLASSIC')
+    custom_path = getattr(settings, 'uv_checker_custom_image', '') if pattern == 'CUSTOM' else ''
+    return repr((
+        "shared-checker-v5",
+        pattern,
+        custom_path,
+        int(settings.uv_checker_density),
+        float(settings.uv_checker_opacity),
+        tuple(settings.uv_checker_color_a),
+        tuple(settings.uv_checker_color_b),
+    ))
+
+
+def _detach_checker_modifiers():
+    """Drop every checker modifier so the material can be changed safely.
+
+    Blender evaluates materials referenced by geometry-node modifiers on a
+    worker thread; editing or freeing that material while the depsgraph is
+    evaluating it can crash (ntree_copy_data). Detaching all modifiers first
+    guarantees no evaluated copy references the material during the update.
+    """
+    for obj in bpy.data.objects:
+        if obj.type != 'MESH':
+            continue
+        modifier = _legacy_preview_modifier(obj)
+        if modifier is not None:
+            obj.modifiers.remove(modifier)
 
 
 def _shared_checker_group(prefs):
@@ -657,15 +867,12 @@ def _shared_checker_group(prefs):
                 break
         group[_GROUP_MATERIAL_KEY] = material.name
 
-    signature = repr((
-        "shared-checker-v1",
-        int(prefs.uv_checker_density),
-        float(prefs.uv_checker_opacity),
-        tuple(prefs.uv_checker_color_a),
-        tuple(prefs.uv_checker_color_b),
-    ))
+    signature = _checker_signature(prefs)
     if group.get(_GROUP_SIGNATURE_KEY, "") != signature:
-        _build_checker_material(material, "", "", prefs)
+        # Prefer an in-place update: rebuilding the material's node tree while
+        # the checker modifier is being evaluated can crash Blender's depsgraph.
+        if not _update_checker_material(material, prefs):
+            _build_checker_material(material, "", "", prefs)
         group[_GROUP_SIGNATURE_KEY] = signature
     return group
 
@@ -897,6 +1104,17 @@ def refresh_timer():
     if not full_refresh and not dirty_entries:
         full_refresh = True
 
+    checker_group = bpy.data.node_groups.get(_SHARED_CHECKER_GROUP)
+    checker_changed = (
+        prefs.uv_show_checker
+        and checker_group is not None
+        and checker_group.get(_GROUP_SIGNATURE_KEY, "") != _checker_signature(prefs)
+    )
+    if checker_changed:
+        # See _detach_checker_modifiers: never touch the checker material while
+        # a geometry-nodes modifier still references it.
+        _detach_checker_modifiers()
+
     state.refresh_in_progress = True
     try:
         if full_refresh:
@@ -940,7 +1158,8 @@ def refresh_timer():
             state.uv_display_dirty = any(item.dirty for item in state.uv_mesh_states)
     finally:
         state.refresh_in_progress = False
-    _remove_checker_images()
+    if not prefs.uv_show_checker:
+        _remove_checker_images()
     if prefs.uv_show_checker:
         _start_checker_watchdog()
         return None
@@ -1047,13 +1266,14 @@ def _edit_transform_active(window):
     )
 
 
-def set_viewport_mode(context, enabled, display_color_type='VERTEX'):
+def set_viewport_mode(context, enabled, display_color_type='VERTEX',
+                      shading_type='SOLID'):
     if context.area is None or context.area.type != 'VIEW_3D' or context.scene is None:
         return
     state = context.scene.model_checker_state
     shading = context.area.spaces.active.shading
     if enabled:
-        desired_type = 'SOLID'
+        desired_type = shading_type
         if (shading.type != desired_type or shading.color_type != display_color_type) and not state.preview_shading_saved:
             state.preview_area_pointer = str(context.area.as_pointer())
             state.preview_shading_type = shading.type
@@ -1065,7 +1285,8 @@ def set_viewport_mode(context, enabled, display_color_type='VERTEX'):
     restore_viewport_mode(context.scene, context.area)
 
 
-def sync_viewport_mode(scene, enabled, display_color_type='VERTEX'):
+def sync_viewport_mode(scene, enabled, display_color_type='VERTEX',
+                       shading_type='SOLID'):
     """Update the viewport that entered diagnostics outside an operator context."""
     state = scene.model_checker_state if hasattr(scene, 'model_checker_state') else None
     if state is None or not state.preview_shading_saved:
@@ -1084,7 +1305,7 @@ def sync_viewport_mode(scene, enabled, display_color_type='VERTEX'):
             if area.type != 'VIEW_3D' or str(area.as_pointer()) != target_pointer:
                 continue
             shading = area.spaces.active.shading
-            shading.type = 'SOLID'
+            shading.type = shading_type
             shading.color_type = display_color_type
             area.tag_redraw()
             return

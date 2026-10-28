@@ -2,7 +2,14 @@
 
 import bpy
 import bmesh
-from bpy.props import BoolProperty, EnumProperty, FloatProperty, FloatVectorProperty, IntProperty
+from bpy.props import (
+    BoolProperty,
+    EnumProperty,
+    FloatProperty,
+    FloatVectorProperty,
+    IntProperty,
+    StringProperty,
+)
 
 from . import diagnostic
 
@@ -14,10 +21,7 @@ _UV_FEATURE_SETTINGS = {
         "uv_stretch_threshold", "uv_stretch_opacity",
     ),
     'uv_show_boundaries': ("uv_boundary_color", "uv_boundary_width"),
-    'uv_show_checker': (
-        "uv_checker_opacity", "uv_checker_density", "uv_checker_color_a",
-        "uv_checker_color_b",
-    ),
+    'uv_show_checker': (),
     'uv_show_orientation': (
         "uv_orientation_front_color", "uv_orientation_back_color",
         "uv_orientation_opacity",
@@ -328,6 +332,16 @@ class MC_OT_toggle_uv_overlay(bpy.types.Operator):
     uv_checker_density: IntProperty(name="棋盘格密度", default=8, min=1, max=256)
     uv_checker_color_a: FloatVectorProperty(name="棋盘格颜色 A", subtype='COLOR', size=3, default=(0.95, 0.95, 0.95), min=0.0, max=1.0)
     uv_checker_color_b: FloatVectorProperty(name="棋盘格颜色 B", subtype='COLOR', size=3, default=(0.12, 0.12, 0.12), min=0.0, max=1.0)
+    uv_checker_pattern: EnumProperty(
+        name="棋盘格图案",
+        items=diagnostic.CHECKER_PATTERN_ITEMS,
+        default='CLASSIC',
+    )
+    uv_checker_custom_image: StringProperty(
+        name="自定义棋盘格图片",
+        subtype='FILE_PATH',
+        default="",
+    )
     uv_orientation_front_color: FloatVectorProperty(name="正向颜色", subtype='COLOR', size=3, default=(0.43, 0.78, 1.0), min=0.0, max=1.0)
     uv_orientation_back_color: FloatVectorProperty(name="反向颜色", subtype='COLOR', size=3, default=(0.94, 0.045, 0.055), min=0.0, max=1.0)
     uv_orientation_opacity: FloatProperty(name="UV 正反透明度", default=0.9, min=0.0, max=1.0)
@@ -364,10 +378,24 @@ class MC_OT_toggle_uv_overlay(bpy.types.Operator):
             layout.prop(self, "uv_boundary_width", slider=True)
         elif self.feature == 'uv_show_checker':
             layout.label(text="棋盘格")
-            layout.prop(self, "uv_checker_opacity", slider=True)
-            layout.prop(self, "uv_checker_density")
-            layout.prop(self, "uv_checker_color_a")
-            layout.prop(self, "uv_checker_color_b")
+            prefs = _read_preferences(context)
+            if prefs is None:
+                layout.label(text="棋盘格设置不可用", icon='ERROR')
+            else:
+                layout.prop(prefs, "uv_checker_pattern")
+                layout.prop(prefs, "uv_checker_opacity", slider=True)
+                layout.prop(prefs, "uv_checker_density")
+                layout.label(text="每个图案/图片独立记忆密度", icon='INFO')
+                if prefs.uv_checker_pattern == 'CLASSIC':
+                    layout.prop(prefs, "uv_checker_color_a")
+                    layout.prop(prefs, "uv_checker_color_b")
+                elif prefs.uv_checker_pattern == 'CUSTOM':
+                    layout.prop(prefs, "uv_checker_custom_image")
+                    if not diagnostic.checker_custom_image_available(prefs):
+                        layout.label(text="图片无效，将暂时使用经典棋盘", icon='ERROR')
+                    layout.label(text="密度 8 = 原图 1:1，数值越大平铺越密", icon='INFO')
+                else:
+                    layout.label(text="密度 8 = 原图 1:1（8×8 格），越大越密", icon='INFO')
         else:
             layout.label(text="UV 正反")
             layout.prop(self, "uv_orientation_front_color")
@@ -457,10 +485,20 @@ class MC_OT_settings_popup(bpy.types.Operator):
             layout.prop(prefs, "uv_boundary_width", slider=True)
         elif self.target == 'UV_CHECKER':
             layout.label(text="UV 棋盘格")
+            layout.prop(prefs, "uv_checker_pattern")
             layout.prop(prefs, "uv_checker_opacity", slider=True)
             layout.prop(prefs, "uv_checker_density")
-            layout.prop(prefs, "uv_checker_color_a")
-            layout.prop(prefs, "uv_checker_color_b")
+            layout.label(text="每个图案/图片独立记忆密度", icon='INFO')
+            if prefs.uv_checker_pattern == 'CLASSIC':
+                layout.prop(prefs, "uv_checker_color_a")
+                layout.prop(prefs, "uv_checker_color_b")
+            elif prefs.uv_checker_pattern == 'CUSTOM':
+                layout.prop(prefs, "uv_checker_custom_image")
+                if not diagnostic.checker_custom_image_available(prefs):
+                    layout.label(text="图片无效，将暂时使用经典棋盘", icon='ERROR')
+                layout.label(text="密度 8 = 原图 1:1，数值越大平铺越密", icon='INFO')
+            else:
+                layout.label(text="密度 8 = 原图 1:1（8×8 格），越大越密", icon='INFO')
         elif self.target == 'UV_ORIENTATION':
             layout.label(text="UV 正反")
             layout.prop(prefs, "uv_orientation_front_color")

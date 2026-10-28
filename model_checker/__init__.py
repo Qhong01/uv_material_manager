@@ -11,6 +11,7 @@ bl_info = {
 }
 
 import importlib
+import json
 import time
 
 import bpy
@@ -45,6 +46,11 @@ def _redraw_viewports():
 
 def _save_user_preferences():
     """Persist the add-on's shared checker settings after the user finishes editing."""
+    # Never touch the real user preferences from automated/测试 instances:
+    # ``--background`` / ``--factory-startup`` runs must not overwrite the
+    # profile of the running Blender the user is working in.
+    if bpy.app.background or getattr(bpy.app, "factory_startup", False):
+        return None
     try:
         bpy.ops.wm.save_userpref()
     except RuntimeError as exc:
@@ -67,7 +73,8 @@ def _sync_scene_overlay(scene, prefs):
         "uv_stretch_max_color", "uv_stretch_strength", "uv_stretch_threshold",
         "uv_stretch_opacity",
         "uv_checker_opacity", "uv_checker_density", "uv_checker_color_a",
-        "uv_checker_color_b", "uv_orientation_opacity",
+        "uv_checker_color_b", "uv_checker_pattern", "uv_checker_custom_image",
+        "uv_orientation_opacity",
         "uv_orientation_front_color", "uv_orientation_back_color",
     ):
         setattr(scene_state, name, getattr(prefs, name))
@@ -115,7 +122,87 @@ def _update_scene_overlay(self, context):
     _schedule_preferences_save()
 
 
+_CHECKER_DEFAULT_DENSITY = 8
+
+
+def _checker_density_key(prefs):
+    """Identify the image the density slider currently belongs to."""
+    pattern = getattr(prefs, 'uv_checker_pattern', 'CLASSIC')
+    if pattern == 'CUSTOM':
+        path = getattr(prefs, 'uv_checker_custom_image', '')
+        return 'CUSTOM:' + bpy.path.abspath(path) if path else 'CUSTOM:'
+    return pattern
+
+
+def _read_checker_densities(prefs):
+    raw = getattr(prefs, 'uv_checker_density_map', '')
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    result = {}
+    for key, value in data.items():
+        try:
+            result[str(key)] = max(1, min(256, int(value)))
+        except (TypeError, ValueError):
+            continue
+    return result
+
+
+def _write_checker_densities(prefs, data):
+    prefs.uv_checker_density_map = json.dumps(
+        data, ensure_ascii=False, sort_keys=True)
+
+
+def _remember_checker_density(prefs):
+    if getattr(prefs, 'uv_checker_density_switching', False):
+        return
+    key = getattr(prefs, 'uv_checker_density_key', '') or _checker_density_key(prefs)
+    data = _read_checker_densities(prefs)
+    data[key] = int(prefs.uv_checker_density)
+    _write_checker_densities(prefs, data)
+    prefs.uv_checker_density_key = key
+
+
+def _init_checker_density_key(prefs):
+    """Bind the legacy global density to the currently selected image once."""
+    if prefs.uv_checker_density_key:
+        return
+    key = _checker_density_key(prefs)
+    prefs.uv_checker_density_key = key
+    data = _read_checker_densities(prefs)
+    data.setdefault(key, int(prefs.uv_checker_density))
+    _write_checker_densities(prefs, data)
+
+
+def _update_checker_pattern(self, context):
+    """Per-image density: store the old image's value, restore the new one."""
+    if getattr(self, 'uv_checker_density_switching', False):
+        return
+    self.uv_checker_density_switching = True
+    try:
+        data = _read_checker_densities(self)
+        old_key = self.uv_checker_density_key
+        if old_key:
+            data[old_key] = int(self.uv_checker_density)
+        new_key = _checker_density_key(self)
+        density = data.get(new_key, _CHECKER_DEFAULT_DENSITY)
+        self.uv_checker_density = density
+        self.uv_checker_density_key = new_key
+        _write_checker_densities(self, data)
+    finally:
+        self.uv_checker_density_switching = False
+    _update_checker_settings(self, context)
+
+
 def _update_checker_settings(self, context):
+    if getattr(self, 'uv_checker_density_switching', False):
+        return
+    _remember_checker_density(self)
     deadline = time.monotonic() + 0.4
     for scene in bpy.data.scenes:
         if not hasattr(scene, "model_checker_state"):
@@ -124,6 +211,7 @@ def _update_checker_settings(self, context):
         for name in (
             "uv_checker_opacity", "uv_checker_density",
             "uv_checker_color_a", "uv_checker_color_b",
+            "uv_checker_pattern", "uv_checker_custom_image",
         ):
             setattr(state, name, getattr(self, name))
         diagnostic.mark_full_refresh(state)
@@ -146,6 +234,7 @@ def _update_boundary_width(self, context):
 def _restore_overlay_settings(_dummy):
     addon = bpy.context.preferences.addons.get(ADDON_ID)
     if addon is not None:
+        _init_checker_density_key(addon.preferences)
         _enforce_uv_display_exclusivity(addon.preferences)
         _sync_all_scenes(addon.preferences)
         diagnostic.start_refresh_timer()
@@ -206,6 +295,8 @@ class MC_PG_scene_state(bpy.types.PropertyGroup):
     uv_checker_density: IntProperty(default=8, min=1, max=256, options={'SKIP_SAVE'})
     uv_checker_color_a: FloatVectorProperty(size=3, subtype='COLOR', default=(0.95, 0.95, 0.95), min=0.0, max=1.0, options={'SKIP_SAVE'})
     uv_checker_color_b: FloatVectorProperty(size=3, subtype='COLOR', default=(0.12, 0.12, 0.12), min=0.0, max=1.0, options={'SKIP_SAVE'})
+    uv_checker_pattern: EnumProperty(items=diagnostic.CHECKER_PATTERN_ITEMS, default='CLASSIC', options={'SKIP_SAVE'})
+    uv_checker_custom_image: StringProperty(default="", subtype='FILE_PATH', options={'SKIP_SAVE'})
     uv_show_orientation: BoolProperty(default=False, options={'SKIP_SAVE'})
     uv_orientation_opacity: FloatProperty(default=0.9, min=0.0, max=1.0, options={'SKIP_SAVE'})
     uv_orientation_front_color: FloatVectorProperty(size=3, subtype='COLOR', default=(0.43, 0.78, 1.0), min=0.0, max=1.0, options={'SKIP_SAVE'})
@@ -378,6 +469,7 @@ def _initialize_after_register():
     _migrate_overlay_opacity_defaults()
     addon = bpy.context.preferences.addons.get(ADDON_ID)
     if addon is not None:
+        _init_checker_density_key(addon.preferences)
         _enforce_uv_display_exclusivity(addon.preferences)
         _sync_all_scenes(addon.preferences)
         diagnostic.start_refresh_timer()
