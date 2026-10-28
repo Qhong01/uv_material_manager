@@ -87,17 +87,17 @@ def _draw_overlay():
     if context.scene is None or context.region_data is None:
         return
     state = context.scene.model_checker_state
-    if not state.overlay_active:
-        _DRAW_CACHE.pop(context.scene.as_pointer(), None)
+    scene_key = context.scene.as_pointer()
+    if not state.overlay_active or not state.uv_show_boundaries:
+        _DRAW_CACHE.pop(scene_key, None)
         return
     objects = tuple(
         obj for obj in context.scene.objects
         if obj.type == 'MESH' and obj.visible_get(view_layer=context.view_layer)
     )
-    scene_key = context.scene.as_pointer()
-    signature = None
+    signature = _overlay_signature(context.mode, objects, state)
     cached = _DRAW_CACHE.get(scene_key)
-    if cached is None or state.overlay_cache_dirty:
+    if cached is None or state.overlay_cache_dirty or cached[0] != signature:
         window = context.window
         modal_active = _edit_transform_active(window)
         if modal_active:
@@ -169,24 +169,41 @@ def _invalidate_overlay_cache(scene, depsgraph):
         return
     if state.refresh_in_progress:
         return
+    changed_meshes = set()
+    transformed_meshes = set()
     for update in depsgraph.updates:
-        updated_id = update.id
+        updated_id = update.id.original or update.id
         if isinstance(updated_id, bpy.types.Mesh):
-            is_mesh_update = True
+            if update.is_updated_geometry:
+                changed_meshes.add(updated_id)
         elif isinstance(updated_id, bpy.types.Object) and updated_id.type == 'MESH':
-            is_mesh_update = True
-        else:
-            is_mesh_update = False
-        if not is_mesh_update:
-            continue
-        state.overlay_cache_dirty = True
-        state.uv_display_dirty = True
-        state.uv_refresh_cursor = 0
+            if update.is_updated_geometry:
+                changed_meshes.add(updated_id.data)
+            if update.is_updated_transform:
+                transformed_meshes.add(updated_id.data)
+    if not changed_meshes and not transformed_meshes:
+        return
+
+    state.overlay_cache_dirty = True
+    if not (state.uv_show_stretch or state.uv_show_checker or state.uv_show_orientation):
+        return
+
+    from . import diagnostic
+    if state.uv_show_checker:
+        diagnostic.mark_full_refresh(state)
+        needs_refresh = True
+    else:
+        needs_refresh = False
+        for mesh in changed_meshes | transformed_meshes:
+            needs_refresh = diagnostic.mark_mesh_dirty(
+                state,
+                mesh,
+                force=mesh in transformed_meshes,
+            ) or needs_refresh
+    if needs_refresh:
         if bpy.context.mode == 'EDIT_MESH':
             state.uv_display_defer_until = time.monotonic() + 0.6
-        from . import diagnostic
         diagnostic.start_refresh_timer()
-        return
 
 
 @persistent

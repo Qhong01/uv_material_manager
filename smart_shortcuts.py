@@ -6,6 +6,7 @@ import bpy
 _MIRRORS = {
     "mesh.uvmm_smart_vertex": "mesh.uvmm_smart_vertex_shortcut",
     "mesh.uvmm_smart_edge": "mesh.uvmm_smart_edge_shortcut",
+    "mesh.uvmm_toggle_sharp": "mesh.uvmm_toggle_sharp_shortcut",
 }
 
 

@@ -14,7 +14,7 @@ import importlib
 import time
 
 import bpy
-from bpy.props import BoolProperty, EnumProperty, FloatProperty, FloatVectorProperty, IntProperty, PointerProperty, StringProperty
+from bpy.props import BoolProperty, CollectionProperty, EnumProperty, FloatProperty, FloatVectorProperty, IntProperty, PointerProperty, StringProperty
 from bpy.app.handlers import persistent
 
 from . import diagnostic, overlay, operators, panel
@@ -78,8 +78,7 @@ def _sync_scene_overlay(scene, prefs):
         scene_state.uv_show_orientation,
     ))
     scene_state.overlay_cache_dirty = True
-    scene_state.uv_display_dirty = True
-    scene_state.uv_refresh_cursor = 0
+    diagnostic.mark_full_refresh(scene_state)
 
 
 def _sync_all_scenes(prefs):
@@ -103,14 +102,6 @@ def _update_scene_overlay(self, context):
         return
     _enforce_uv_display_exclusivity(self)
     _sync_all_scenes(self)
-    refresh_after_adjustment = time.monotonic() + 0.25
-    for scene in bpy.data.scenes:
-        if hasattr(scene, "model_checker_state"):
-            state = scene.model_checker_state
-            state.uv_display_defer_until = max(
-                state.uv_display_defer_until,
-                refresh_after_adjustment,
-            )
     show_diagnostics = any((
         self.uv_show_stretch,
         self.uv_show_checker,
@@ -135,8 +126,7 @@ def _update_checker_settings(self, context):
             "uv_checker_color_a", "uv_checker_color_b",
         ):
             setattr(state, name, getattr(self, name))
-        state.uv_display_dirty = True
-        state.uv_refresh_cursor = 0
+        diagnostic.mark_full_refresh(state)
         if self.uv_show_checker:
             state.uv_display_defer_until = max(state.uv_display_defer_until, deadline)
     diagnostic.start_refresh_timer()
@@ -177,11 +167,19 @@ def _disable_checker_before_lifecycle_change(_dummy):
             continue
         state = scene.model_checker_state
         state.uv_show_checker = False
-        state.uv_display_dirty = True
-        state.uv_refresh_cursor = 0
+        diagnostic.mark_full_refresh(state)
         state.overlay_cache_dirty = True
         remaining = any((state.uv_show_stretch, state.uv_show_orientation))
         diagnostic.sync_viewport_mode(scene, remaining, 'VERTEX')
+
+
+class MC_PG_mesh_state(bpy.types.PropertyGroup):
+    """Cached source signature and invalidation state for one mesh."""
+
+    mesh: PointerProperty(type=bpy.types.Mesh, options={'SKIP_SAVE'})
+    source_signature: StringProperty(default="", options={'SKIP_SAVE'})
+    dirty: BoolProperty(default=False, options={'SKIP_SAVE'})
+    transform_only: BoolProperty(default=False, options={'SKIP_SAVE'})
 
 
 class MC_PG_scene_state(bpy.types.PropertyGroup):
@@ -190,8 +188,9 @@ class MC_PG_scene_state(bpy.types.PropertyGroup):
     overlay_active: BoolProperty(default=False, options={'SKIP_SAVE'})
     overlay_cache_dirty: BoolProperty(default=True, options={'SKIP_SAVE'})
     uv_display_dirty: BoolProperty(default=True, options={'SKIP_SAVE'})
+    uv_display_full_refresh: BoolProperty(default=True, options={'SKIP_SAVE'})
     uv_display_defer_until: FloatProperty(default=0.0, options={'SKIP_SAVE'})
-    uv_refresh_cursor: IntProperty(default=0, options={'SKIP_SAVE'})
+    uv_mesh_states: CollectionProperty(type=MC_PG_mesh_state, options={'SKIP_SAVE'})
     refresh_in_progress: BoolProperty(default=False, options={'SKIP_SAVE'})
     uv_show_stretch: BoolProperty(default=False, options={'SKIP_SAVE'})
     uv_stretch_opacity: FloatProperty(default=0.85, min=0.0, max=1.0, options={'SKIP_SAVE'})
@@ -295,6 +294,7 @@ class MC_AddonPreferences(bpy.types.AddonPreferences):
 
 
 CLASSES = (
+    MC_PG_mesh_state,
     MC_PG_scene_state,
     operators.MC_OT_check_ngons,
     operators.MC_OT_check_isolated_vertices,

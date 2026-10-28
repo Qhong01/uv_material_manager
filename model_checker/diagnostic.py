@@ -1,16 +1,25 @@
 """Viewport UV diagnostics and a temporary image-texture checker preview."""
 
+import hashlib
 import math
 import time
 from array import array
 
 import bpy
 import bmesh
+import numpy as np
 from mathutils import Vector
 
 
 _DISPLAY_ATTR_KEY = "_model_checker_display_attribute"
 _DISPLAY_SIGNATURE_KEY = "_model_checker_display_signature"
+_DISPLAY_MATRIX_KEY = "_model_checker_display_matrix"
+_COLOR_WRITE_TIME_KEY = "_model_checker_color_write_time"
+_STATS_STRETCH_KEY = "_model_checker_stats_stretch"
+_STATS_FLIPPED_KEY = "_model_checker_stats_flipped"
+_STATS_MATRIX_KEY = "_model_checker_stats_matrix"
+_STATS_UV_KEY = "_model_checker_stats_uv"
+_STATS_COUNT_KEY = "_model_checker_stats_count"
 _PREVIOUS_COLOR_KEY = "_model_checker_previous_color_attribute"
 _PREVIOUS_COLOR_HAD_KEY = "_model_checker_previous_color_had_value"
 _DISPLAY_ATTR_BASE = "__ModelChecker_UVDisplay"
@@ -295,33 +304,205 @@ def select_uv_findings_in_edit_mode(objects, prefs):
     return found_faces
 
 
-def _update_object_mesh_colors(obj, uv_layer, display_attr, prefs):
-    mesh = obj.data
-    mesh.calc_loop_triangles()
-    max_stretch = [0.0] * len(mesh.polygons)
-    flipped_votes = [0] * len(mesh.polygons)
-    triangle_counts = [0] * len(mesh.polygons)
-    for triangle in mesh.loop_triangles:
-        loop_indices = tuple(triangle.loops)
-        coords = tuple(
-            obj.matrix_world @ mesh.vertices[mesh.loops[index].vertex_index].co
-            for index in loop_indices
-        )
-        uvs = tuple(Vector(uv_layer.data[index].uv) for index in loop_indices)
-        polygon_index = triangle.polygon_index
-        max_stretch[polygon_index] = max(max_stretch[polygon_index], _triangle_stretch(coords, uvs))
-        uv_a = uvs[1] - uvs[0]
-        uv_b = uvs[2] - uvs[0]
-        if uv_a.x * uv_b.y - uv_a.y * uv_b.x < -1e-12:
-            flipped_votes[polygon_index] += 1
-        triangle_counts[polygon_index] += 1
+def _triangle_stretch_array(coords, uvs):
+    """Vectorised equivalent of _triangle_stretch for every loop triangle.
 
-    for polygon in mesh.polygons:
-        flipped = triangle_counts[polygon.index] > 0 and flipped_votes[polygon.index] * 2 >= triangle_counts[polygon.index]
-        base = _face_base_color(max_stretch[polygon.index], flipped, prefs)
-        for loop_index in polygon.loop_indices:
-            display_attr.data[loop_index].color = _loop_display_color(base)
-    mesh.update()
+    coords: (T, 3, 3) world-space corners, uvs: (T, 3, 2) corner UVs.
+    Returns (stretch, flipped) arrays with one entry per triangle.
+    """
+    edge_1 = coords[:, 1] - coords[:, 0]
+    edge_2 = coords[:, 2] - coords[:, 0]
+    length_1 = np.linalg.norm(edge_1, axis=1)
+    safe_1 = np.maximum(length_1, 1e-12)
+    axis_x = edge_1 / safe_1[:, None]
+    projected_x = np.einsum("ij,ij->i", edge_2, axis_x)
+    orthogonal = edge_2 - axis_x * projected_x[:, None]
+    length_y = np.linalg.norm(orthogonal, axis=1)
+    safe_y = np.maximum(length_y, 1e-12)
+
+    uv_1 = uvs[:, 1] - uvs[:, 0]
+    uv_2 = uvs[:, 2] - uvs[:, 0]
+    a = uv_1[:, 0] / safe_1
+    b = uv_2[:, 0] / safe_y - uv_1[:, 0] * projected_x / (safe_1 * safe_y)
+    c = uv_1[:, 1] / safe_1
+    d = uv_2[:, 1] / safe_y - uv_1[:, 1] * projected_x / (safe_1 * safe_y)
+
+    xx = a * a + c * c
+    yy = b * b + d * d
+    xy = a * b + c * d
+    discriminant = np.sqrt(np.maximum((xx - yy) ** 2 + 4.0 * xy * xy, 0.0))
+    largest = np.sqrt(np.maximum((xx + yy + discriminant) * 0.5, 1e-16))
+    smallest = np.sqrt(np.maximum((xx + yy - discriminant) * 0.5, 1e-16))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        stretch = np.minimum(np.abs(np.log2(largest / smallest)) / 4.0, 1.0)
+
+    signed_area = uv_1[:, 0] * uv_2[:, 1] - uv_1[:, 1] * uv_2[:, 0]
+    degenerate = (
+        (length_1 < 1e-6)
+        | (length_y < 1e-6)
+        | (np.abs(signed_area) < 1e-12)
+    )
+    stretch = np.where(degenerate, 1.0, stretch)
+    flipped = signed_area < -1e-12
+    return stretch, flipped
+
+
+def _face_base_colors_array(stretch, flipped, prefs):
+    """Vectorised equivalent of _face_base_color for all faces at once."""
+    count = len(stretch)
+    background = 0.38
+    threshold = min(max(float(prefs.uv_stretch_threshold), 0.0), 0.999)
+    strength = max(float(prefs.uv_stretch_strength), 0.25)
+    stretch_opacity = float(prefs.uv_stretch_opacity)
+    orientation_opacity = float(prefs.uv_orientation_opacity)
+
+    amount = np.where(
+        stretch <= threshold + 1e-6,
+        0.0,
+        (stretch - threshold) / max(1.0 - threshold, 1e-6),
+    )
+    factor = np.clip(amount, 0.0, 1.0) ** (1.0 / strength)
+    stretch_base = np.asarray(prefs.uv_stretch_base_color, dtype=np.float64)
+    stretch_max = np.asarray(prefs.uv_stretch_max_color, dtype=np.float64)
+    stretch_color = stretch_base + (stretch_max - stretch_base) * factor[:, None]
+    stretch_mix = background + (stretch_color - background) * stretch_opacity
+
+    if prefs.uv_show_orientation:
+        back = np.asarray(prefs.uv_orientation_back_color, dtype=np.float64)
+        front = np.asarray(prefs.uv_orientation_front_color, dtype=np.float64)
+        back_mix = background + (back - background) * orientation_opacity
+        front_mix = background + (front - background) * orientation_opacity
+        if prefs.uv_show_stretch:
+            return np.where(flipped[:, None], back_mix, stretch_mix)
+        return np.where(flipped[:, None], back_mix, front_mix)
+    if prefs.uv_show_stretch:
+        return stretch_mix
+    return np.full((count, 3), background, dtype=np.float64)
+
+
+def _ensure_stats_attributes(mesh):
+    stretch_attr = mesh.attributes.get(_STATS_STRETCH_KEY)
+    if stretch_attr is None or stretch_attr.domain != 'FACE' or stretch_attr.data_type != 'FLOAT':
+        if stretch_attr is not None:
+            mesh.attributes.remove(stretch_attr)
+        stretch_attr = mesh.attributes.new(_STATS_STRETCH_KEY, 'FLOAT', 'FACE')
+    flipped_attr = mesh.attributes.get(_STATS_FLIPPED_KEY)
+    if flipped_attr is None or flipped_attr.domain != 'FACE' or flipped_attr.data_type != 'INT':
+        if flipped_attr is not None:
+            mesh.attributes.remove(flipped_attr)
+        flipped_attr = mesh.attributes.new(_STATS_FLIPPED_KEY, 'INT', 'FACE')
+    return stretch_attr, flipped_attr
+
+
+def _read_stats_cache(mesh, uv_name, matrix_values):
+    """Return cached per-face stretch/flip stats when geometry is unchanged."""
+    if mesh.get(_STATS_UV_KEY, "") != uv_name:
+        return None
+    if int(mesh.get(_STATS_COUNT_KEY, -1)) != len(mesh.polygons):
+        return None
+    stretch_attr = mesh.attributes.get(_STATS_STRETCH_KEY)
+    flipped_attr = mesh.attributes.get(_STATS_FLIPPED_KEY)
+    if stretch_attr is None or flipped_attr is None:
+        return None
+    if stretch_attr.domain != 'FACE' or stretch_attr.data_type != 'FLOAT':
+        return None
+    if flipped_attr.domain != 'FACE' or flipped_attr.data_type != 'INT':
+        return None
+    stored_matrix = tuple(mesh.get(_STATS_MATRIX_KEY, ()))
+    if stored_matrix and not _conformal_delta(stored_matrix, matrix_values):
+        return None
+
+    count = len(mesh.polygons)
+    stretch = np.empty(count, dtype=np.float32)
+    stretch_attr.data.foreach_get("value", stretch)
+    flipped = np.empty(count, dtype=np.int32)
+    flipped_attr.data.foreach_get("value", flipped)
+    if stored_matrix and stored_matrix != matrix_values:
+        mesh[_STATS_MATRIX_KEY] = list(matrix_values)
+    return stretch.astype(np.float64), flipped.astype(bool)
+
+
+def _write_stats_cache(mesh, max_stretch, face_flipped, uv_name, matrix_values):
+    stretch_attr, flipped_attr = _ensure_stats_attributes(mesh)
+    stretch_attr.data.foreach_set("value", max_stretch.astype(np.float32))
+    flipped_attr.data.foreach_set("value", face_flipped.astype(np.int32))
+    mesh[_STATS_UV_KEY] = uv_name
+    mesh[_STATS_MATRIX_KEY] = list(matrix_values)
+    mesh[_STATS_COUNT_KEY] = len(mesh.polygons)
+
+
+def _update_object_mesh_colors(obj, uv_layer, display_attr, prefs, stats_dirty=False):
+    mesh = obj.data
+    matrix = np.asarray(obj.matrix_world, dtype=np.float64)
+    matrix_values = tuple(value for row in obj.matrix_world for value in row)
+    polygon_count = len(mesh.polygons)
+    if polygon_count == 0:
+        return True
+
+    cached = None if stats_dirty else _read_stats_cache(mesh, uv_layer.name, matrix_values)
+    if cached is not None:
+        max_stretch, face_flipped = cached
+    else:
+        mesh.calc_loop_triangles()
+        triangle_count = len(mesh.loop_triangles)
+        if triangle_count == 0:
+            return True
+
+        vertices = np.empty(len(mesh.vertices) * 3, dtype=np.float32)
+        mesh.vertices.foreach_get("co", vertices)
+        local_coords = vertices.reshape(-1, 3).astype(np.float64)
+        world_coords = local_coords @ matrix[:3, :3].T + matrix[:3, 3]
+
+        loop_vertices = np.empty(len(mesh.loops), dtype=np.int32)
+        mesh.loops.foreach_get("vertex_index", loop_vertices)
+        uv_values = np.empty(len(mesh.loops) * 2, dtype=np.float32)
+        uv_layer.data.foreach_get("uv", uv_values)
+        loop_uvs = uv_values.reshape(-1, 2).astype(np.float64)
+
+        triangle_loops = np.empty(triangle_count * 3, dtype=np.int32)
+        mesh.loop_triangles.foreach_get("loops", triangle_loops)
+        triangle_loops = triangle_loops.reshape(-1, 3)
+        triangle_polygons = np.empty(triangle_count, dtype=np.int32)
+        mesh.loop_triangles.foreach_get("polygon_index", triangle_polygons)
+
+        coords = world_coords[loop_vertices[triangle_loops]]
+        uvs = loop_uvs[triangle_loops]
+        stretch, flipped_triangles = _triangle_stretch_array(coords, uvs)
+
+        # loop_triangles are grouped by polygon, so reduceat replaces the much
+        # slower ufunc.at accumulation.
+        triangle_counts = np.bincount(triangle_polygons, minlength=polygon_count)
+        if polygon_count and triangle_counts.size == polygon_count and triangle_counts.all():
+            starts = np.concatenate(([0], np.cumsum(triangle_counts)[:-1])).astype(np.int64)
+            max_stretch = np.maximum.reduceat(stretch, starts)
+            flipped_votes = np.add.reduceat(flipped_triangles.astype(np.int32), starts)
+            face_flipped = flipped_votes * 2 >= triangle_counts
+        else:
+            max_stretch = np.zeros(polygon_count, dtype=np.float64)
+            np.maximum.at(max_stretch, triangle_polygons, stretch)
+            flipped_votes = np.zeros(polygon_count, dtype=np.int32)
+            np.add.at(flipped_votes, triangle_polygons, flipped_triangles.astype(np.int32))
+            face_flipped = (triangle_counts > 0) & (flipped_votes * 2 >= triangle_counts)
+        _write_stats_cache(mesh, max_stretch, face_flipped, uv_layer.name, matrix_values)
+
+    face_colors = _face_base_colors_array(max_stretch, face_flipped, prefs)
+
+    loop_totals = np.empty(polygon_count, dtype=np.int32)
+    mesh.polygons.foreach_get("loop_total", loop_totals)
+    if int(loop_totals.sum()) == len(mesh.loops):
+        loop_polygons = np.repeat(np.arange(polygon_count, dtype=np.int32), loop_totals)
+        rgba = np.ones((len(mesh.loops), 4), dtype=np.float32)
+        rgba[:, :3] = face_colors[loop_polygons].astype(np.float32)
+        display_attr.data.foreach_set("color", rgba.ravel())
+    else:
+        # Non-contiguous loop layout: keep a correct, slower per-polygon path.
+        for polygon in mesh.polygons:
+            color = (*face_colors[polygon.index], 1.0)
+            for loop_index in polygon.loop_indices:
+                display_attr.data[loop_index].color = color
+    # Attribute writes invalidate the depsgraph; remember when so the handler
+    # does not mistake our own output for a user geometry edit.
+    mesh[_COLOR_WRITE_TIME_KEY] = time.monotonic()
     return True
 
 
@@ -412,15 +593,16 @@ def _build_checker_material(material, uv_name, display_name, prefs):
 
     surface_color = None
     if prefs.uv_show_checker:
-        uv_map = nodes.new('ShaderNodeUVMap')
-        uv_map.uv_map = uv_name
         texture = nodes.new('ShaderNodeTexImage')
         texture.image = _checker_image(prefs)
         texture.interpolation = 'Closest'
         texture.extension = 'REPEAT'
         texture.select = True
         nodes.active = texture
-        links.new(uv_map.outputs['UV'], texture.inputs['Vector'])
+        if uv_name:
+            uv_map = nodes.new('ShaderNodeUVMap')
+            uv_map.uv_map = uv_name
+            links.new(uv_map.outputs['UV'], texture.inputs['Vector'])
         surface_color = texture.outputs['Color']
 
     if display_name and (prefs.uv_show_stretch or prefs.uv_show_orientation):
@@ -441,11 +623,15 @@ def _build_checker_material(material, uv_name, display_name, prefs):
     links.new(principled.outputs['BSDF'], output.inputs['Surface'])
 
 
-def _ensure_checker_modifier(obj, uv_name, display_name, prefs):
-    modifier = _legacy_preview_modifier(obj)
-    if modifier is None:
-        material = bpy.data.materials.new(f".Model Checker UV - {obj.name}")
-        group = bpy.data.node_groups.new(f".Model Checker UV - {obj.name}", 'GeometryNodeTree')
+_SHARED_CHECKER_GROUP = ".Model Checker UV - Checker"
+_SHARED_CHECKER_MATERIAL = ".Model Checker UV - Checker"
+
+
+def _shared_checker_group(prefs):
+    """One node group + one material shared by every object preview."""
+    group = bpy.data.node_groups.get(_SHARED_CHECKER_GROUP)
+    if group is None or getattr(group, "bl_idname", "") != 'GeometryNodeTree':
+        group = bpy.data.node_groups.new(_SHARED_CHECKER_GROUP, 'GeometryNodeTree')
         group.is_modifier = True
         group.interface.new_socket(name="Geometry", in_out='INPUT', socket_type='NodeSocketGeometry')
         group.interface.new_socket(name="Geometry", in_out='OUTPUT', socket_type='NodeSocketGeometry')
@@ -453,49 +639,45 @@ def _ensure_checker_modifier(obj, uv_name, display_name, prefs):
         group_input = group.nodes.new('NodeGroupInput')
         group_output = group.nodes.new('NodeGroupOutput')
         set_material = group.nodes.new('GeometryNodeSetMaterial')
+        material = bpy.data.materials.get(_SHARED_CHECKER_MATERIAL)
+        if material is None:
+            material = bpy.data.materials.new(_SHARED_CHECKER_MATERIAL)
         set_material.inputs['Material'].default_value = material
         group.links.new(group_input.outputs['Geometry'], set_material.inputs['Geometry'])
         group.links.new(set_material.outputs['Geometry'], group_output.inputs['Geometry'])
-        modifier = obj.modifiers.new("模型检查 UV 棋盘格", 'NODES')
-        modifier.node_group = group
-        modifier.show_render = False
-        modifier.show_in_editmode = True
         group[_GROUP_MATERIAL_KEY] = material.name
-    modifier.show_render = False
-    modifier.show_in_editmode = True
-    group = modifier.node_group
-    material_name = group.get(_GROUP_MATERIAL_KEY, "")
-    material = bpy.data.materials.get(material_name)
+        group[_GROUP_SIGNATURE_KEY] = ""
+
+    material = bpy.data.materials.get(_SHARED_CHECKER_MATERIAL)
     if material is None:
-        material = bpy.data.materials.new(f".Model Checker UV - {obj.name}")
-        group[_GROUP_MATERIAL_KEY] = material.name
+        material = bpy.data.materials.new(_SHARED_CHECKER_MATERIAL)
         for node in group.nodes:
             if node.bl_idname == 'GeometryNodeSetMaterial':
                 node.inputs['Material'].default_value = material
                 break
+        group[_GROUP_MATERIAL_KEY] = material.name
+
     signature = repr((
-        "material-preview-composite-v2-lowres-checker",
-        uv_name,
-        display_name,
-        bool(prefs.uv_show_checker),
-        bool(prefs.uv_show_stretch),
-        bool(prefs.uv_show_orientation),
+        "shared-checker-v1",
         int(prefs.uv_checker_density),
         float(prefs.uv_checker_opacity),
         tuple(prefs.uv_checker_color_a),
         tuple(prefs.uv_checker_color_b),
-        tuple(prefs.uv_stretch_base_color),
-        tuple(prefs.uv_stretch_max_color),
-        float(prefs.uv_stretch_strength),
-        float(prefs.uv_stretch_threshold),
-        float(prefs.uv_stretch_opacity),
-        tuple(prefs.uv_orientation_front_color),
-        tuple(prefs.uv_orientation_back_color),
-        float(prefs.uv_orientation_opacity),
     ))
     if group.get(_GROUP_SIGNATURE_KEY, "") != signature:
-        _build_checker_material(material, uv_name, display_name, prefs)
+        _build_checker_material(material, "", "", prefs)
         group[_GROUP_SIGNATURE_KEY] = signature
+    return group
+
+
+def _ensure_checker_modifier(obj, uv_name, display_name, prefs):
+    group = _shared_checker_group(prefs)
+    modifier = _legacy_preview_modifier(obj)
+    if modifier is None:
+        modifier = obj.modifiers.new("模型检查 UV 棋盘格", 'NODES')
+    modifier.node_group = group
+    modifier.show_render = False
+    modifier.show_in_editmode = True
     return modifier
 
 
@@ -517,7 +699,14 @@ def _remove_diagnostic_attributes(mesh):
         attribute = mesh.color_attributes.get(display_name)
         if attribute is not None:
             mesh.color_attributes.remove(attribute)
-    for key in (_DISPLAY_ATTR_KEY, _DISPLAY_SIGNATURE_KEY, _PREVIOUS_COLOR_KEY, _PREVIOUS_COLOR_HAD_KEY):
+    for key in (
+        _DISPLAY_ATTR_KEY,
+        _DISPLAY_SIGNATURE_KEY,
+        _DISPLAY_MATRIX_KEY,
+        _COLOR_WRITE_TIME_KEY,
+        _PREVIOUS_COLOR_KEY,
+        _PREVIOUS_COLOR_HAD_KEY,
+    ):
         if key in mesh:
             del mesh[key]
     for key in _LEGACY_MESH_KEYS:
@@ -527,6 +716,44 @@ def _remove_diagnostic_attributes(mesh):
             mesh.attributes.remove(attribute)
         if key in mesh:
             del mesh[key]
+    for name in (_STATS_STRETCH_KEY, _STATS_FLIPPED_KEY):
+        attribute = mesh.attributes.get(name)
+        if attribute is not None:
+            mesh.attributes.remove(attribute)
+    for key in (_STATS_MATRIX_KEY, _STATS_UV_KEY, _STATS_COUNT_KEY):
+        if key in mesh:
+            del mesh[key]
+
+
+def _conformal_delta(old_values, new_values, tolerance=1e-4):
+    """True when new = (uniform scale + rotation + translation) * old.
+
+    Such a transform preserves every world-space length ratio, so the stretch
+    heatmap and the flipped-face classification stay valid without recomputing.
+    """
+    if len(old_values) != 16 or len(new_values) != 16:
+        return False
+    from mathutils import Matrix
+
+    old = Matrix((old_values[0:4], old_values[4:8], old_values[8:12], old_values[12:16]))
+    new = Matrix((new_values[0:4], new_values[4:8], new_values[8:12], new_values[12:16]))
+    try:
+        delta = new @ old.inverted()
+    except (ValueError, ZeroDivisionError):
+        return False
+    linear = delta.to_3x3()
+    columns = [linear.col[index] for index in range(3)]
+    lengths = [column.length for column in columns]
+    longest = max(lengths)
+    if longest < 1e-9 or min(lengths) < longest * (1.0 - tolerance):
+        return False
+    if abs(longest - min(lengths)) > longest * tolerance:
+        return False
+    for first in range(3):
+        for second in range(first + 1, 3):
+            if abs(columns[first].dot(columns[second])) > longest * longest * tolerance:
+                return False
+    return linear.determinant() > 0.0
 
 
 def _ensure_preview(obj, prefs, force_update=False):
@@ -561,32 +788,75 @@ def _ensure_preview(obj, prefs, force_update=False):
         float(prefs.uv_orientation_opacity),
         tuple(prefs.uv_orientation_front_color),
         tuple(prefs.uv_orientation_back_color),
-        tuple(value for row in obj.matrix_world for value in row),
     ))
+    matrix_values = tuple(value for row in obj.matrix_world for value in row)
+    stored_signature = mesh.get(_DISPLAY_SIGNATURE_KEY, "")
+    stored_matrix = tuple(mesh.get(_DISPLAY_MATRIX_KEY, ()))
     if not needs_color_diagnostics:
         updated = True
-    elif not force_update and mesh.get(_DISPLAY_SIGNATURE_KEY, "") == signature:
-        updated = True
-    elif obj.mode == 'EDIT':
+    elif force_update:
         updated = False
-        for _attempt in range(3):
-            updated = _update_edit_mesh_colors(obj, active_uv_name, display_name, prefs)
-            if updated:
-                break
+    elif stored_signature == signature and stored_matrix:
+        # Same look; only skip when the object moved by a conformal transform.
+        updated = _conformal_delta(stored_matrix, matrix_values)
     else:
-        current_uv = mesh.uv_layers.get(active_uv_name)
-        updated = current_uv is not None
-        if updated:
-            _update_object_mesh_colors(obj, current_uv, display_attr, prefs)
-    if updated:
-        if needs_color_diagnostics:
-            mesh[_DISPLAY_SIGNATURE_KEY] = signature
+        updated = False
+    if not updated:
+        if obj.mode == 'EDIT':
+            updated = False
+            for _attempt in range(3):
+                updated = _update_edit_mesh_colors(obj, active_uv_name, display_name, prefs)
+                if updated:
+                    break
+        else:
+            current_uv = mesh.uv_layers.get(active_uv_name)
+            updated = current_uv is not None
+            if updated:
+                _update_object_mesh_colors(obj, current_uv, display_attr, prefs, stats_dirty=force_update)
+    if updated and needs_color_diagnostics:
+        mesh[_DISPLAY_SIGNATURE_KEY] = signature
+        mesh[_DISPLAY_MATRIX_KEY] = matrix_values
     if prefs.uv_show_checker:
         checker_modifier = _ensure_checker_modifier(obj, active_uv_name, display_name, prefs)
         checker_modifier.show_viewport = not needs_color_diagnostics
     else:
         _remove_legacy_preview(obj)
     return updated
+
+
+def _start_checker_watchdog():
+    if not bpy.app.timers.is_registered(_checker_watchdog):
+        bpy.app.timers.register(_checker_watchdog, first_interval=0.5)
+
+
+def _checker_watchdog():
+    """Cheap poll: only rebuild previews when the visible object set changed.
+
+    Replaces the old behaviour of recomputing every mesh 4x per second while
+    the checker preview was enabled.
+    """
+    context = bpy.context
+    scene = context.scene
+    if scene is None or not hasattr(scene, "model_checker_state"):
+        return None
+    addon = context.preferences.addons.get(__package__.split('.')[0])
+    if addon is None or not addon.preferences.uv_show_checker:
+        return None
+    state = scene.model_checker_state
+    if state.refresh_in_progress:
+        return 0.2
+    group = bpy.data.node_groups.get(_SHARED_CHECKER_GROUP)
+    if group is None:
+        mark_full_refresh(state)
+        start_refresh_timer()
+        return 0.2
+    for obj in visible_meshes(scene, context.view_layer):
+        modifier = _legacy_preview_modifier(obj)
+        if modifier is None or modifier.node_group is not group:
+            mark_full_refresh(state)
+            start_refresh_timer()
+            return 0.2
+    return 0.5
 
 
 def refresh_timer():
@@ -602,11 +872,11 @@ def refresh_timer():
     prefs = addon.preferences
     active = _feature_enabled(prefs)
     if not state.uv_display_dirty:
+        if prefs.uv_show_checker:
+            _start_checker_watchdog()
         if not active:
             restore_viewport_mode(scene)
         return None
-    visible_objects = set(visible_meshes(scene, context.view_layer)) if active else set()
-    visible_mesh_data = {obj.data for obj in visible_objects}
     window = context.window
     edit_transform_active = (
         context.mode == 'EDIT_MESH'
@@ -621,41 +891,137 @@ def refresh_timer():
     )
     if defer_preview_refresh:
         return 0.25
-    objects = tuple(scene.objects)
-    start = min(state.uv_refresh_cursor, len(objects))
-    stop = min(start + 8, len(objects))
-    refresh_pending = stop < len(objects)
+
+    full_refresh = state.uv_display_full_refresh or prefs.uv_show_checker
+    dirty_entries = tuple(item for item in state.uv_mesh_states if item.dirty)
+    if not full_refresh and not dirty_entries:
+        full_refresh = True
+
     state.refresh_in_progress = True
     try:
-        for obj in objects[start:stop]:
-            if obj.type != 'MESH':
-                continue
-            if obj in visible_objects:
-                _ensure_preview(
-                    obj,
-                    prefs,
-                    force_update=state.uv_display_dirty,
-                )
-            elif mesh_has_diagnostic(obj.data) or _legacy_preview_modifier(obj) is not None:
-                _remove_legacy_preview(obj)
-                if obj.data not in visible_mesh_data:
-                    _remove_diagnostic_attributes(obj.data)
-
-        if refresh_pending:
-            state.uv_refresh_cursor = stop
-        else:
-            state.uv_refresh_cursor = 0
+        if full_refresh:
+            visible_objects = set(visible_meshes(scene, context.view_layer)) if active else set()
+            visible_mesh_data = {obj.data for obj in visible_objects}
+            state.uv_mesh_states.clear()
+            for obj in tuple(scene.objects):
+                if obj.type != 'MESH':
+                    continue
+                if obj in visible_objects:
+                    _ensure_preview(obj, prefs, force_update=False)
+                elif mesh_has_diagnostic(obj.data) or _legacy_preview_modifier(obj) is not None:
+                    _remove_legacy_preview(obj)
+                    if obj.data not in visible_mesh_data:
+                        _remove_diagnostic_attributes(obj.data)
+            state.uv_display_full_refresh = False
             state.uv_display_dirty = False
+        else:
+            dirty_meshes = {item.mesh for item in dirty_entries if item.mesh is not None}
+            objects_by_mesh = {}
+            visibility_by_mesh = {}
+            for obj in scene.objects:
+                if obj.type == 'MESH' and obj.data in dirty_meshes:
+                    visible = obj.visible_get(view_layer=context.view_layer)
+                    previous_visibility = visibility_by_mesh.get(obj.data, False)
+                    if obj.data not in objects_by_mesh or visible or not previous_visibility:
+                        objects_by_mesh[obj.data] = obj
+                        visibility_by_mesh[obj.data] = visible
+
+            for item in dirty_entries:
+                mesh = item.mesh
+                if mesh is None:
+                    item.dirty = False
+                    continue
+                obj = objects_by_mesh.get(mesh)
+                if obj is None:
+                    continue
+                _ensure_preview(obj, prefs, force_update=not item.transform_only)
+                item.dirty = False
+                item.transform_only = False
+            state.uv_display_dirty = any(item.dirty for item in state.uv_mesh_states)
     finally:
         state.refresh_in_progress = False
-    if not refresh_pending:
-        _remove_checker_images()
-    if refresh_pending:
-        return 0.05
+    _remove_checker_images()
+    if prefs.uv_show_checker:
+        _start_checker_watchdog()
+        return None
     if active:
         return None
     restore_viewport_mode(scene)
     return None
+
+
+def mesh_source_signature(mesh):
+    """Hash only the mesh inputs used by UV diagnostics, excluding display colors."""
+    digest = hashlib.blake2b(digest_size=16)
+    active_uv = mesh.uv_layers.active
+    active_uv_name = active_uv.name if active_uv is not None else ""
+    digest.update(active_uv_name.encode('utf-8'))
+    digest.update(str((len(mesh.vertices), len(mesh.loops), len(mesh.polygons))).encode('ascii'))
+
+    coordinates = array('f', [0.0]) * (len(mesh.vertices) * 3)
+    if coordinates:
+        mesh.vertices.foreach_get("co", coordinates)
+        digest.update(coordinates.tobytes())
+
+    loop_vertices = array('i', [0]) * len(mesh.loops)
+    if loop_vertices:
+        mesh.loops.foreach_get("vertex_index", loop_vertices)
+        digest.update(loop_vertices.tobytes())
+
+    loop_totals = array('i', [0]) * len(mesh.polygons)
+    if loop_totals:
+        mesh.polygons.foreach_get("loop_total", loop_totals)
+        digest.update(loop_totals.tobytes())
+
+    if active_uv is not None:
+        uv_coordinates = array('f', [0.0]) * (len(active_uv.data) * 2)
+        if uv_coordinates:
+            active_uv.data.foreach_get("uv", uv_coordinates)
+            digest.update(uv_coordinates.tobytes())
+    return digest.hexdigest()
+
+
+def _find_mesh_state(state, mesh):
+    mesh_pointer = mesh.as_pointer()
+    return next((
+        item for item in state.uv_mesh_states
+        if item.mesh is not None and item.mesh.as_pointer() == mesh_pointer
+    ), None)
+
+
+def _store_mesh_source_signature(state, mesh):
+    item = _find_mesh_state(state, mesh)
+    if item is None:
+        item = state.uv_mesh_states.add()
+        item.mesh = mesh
+    item.source_signature = mesh_source_signature(mesh)
+    item.dirty = False
+    return item
+
+
+def mark_full_refresh(state):
+    state.uv_display_dirty = True
+    state.uv_display_full_refresh = True
+
+
+def mark_mesh_dirty(state, mesh, force=False):
+    if state.uv_display_full_refresh:
+        return False
+    if not force:
+        last_write = float(mesh.get(_COLOR_WRITE_TIME_KEY, 0.0))
+        if last_write and time.monotonic() - last_write < 0.25:
+            # Depsgraph echo of our own colour-attribute write.
+            return False
+    item = _find_mesh_state(state, mesh)
+    if item is None:
+        item = state.uv_mesh_states.add()
+        item.mesh = mesh
+    item.dirty = True
+    # `force` means the depsgraph only reported a transform, so the colour
+    # buffer can be reused when the transform preserves length ratios.
+    item.transform_only = force
+    state.uv_display_dirty = True
+    return True
 
 
 def mesh_has_diagnostic(mesh):

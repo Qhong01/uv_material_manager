@@ -1165,6 +1165,8 @@ class WORKSPACE_OT_AddCustomLayoutItem(Operator):
         new_item.ratio = 0.4
 
         save_scene_layouts_to_json(scene)
+        from . import shortcut_panel
+        shortcut_panel.ensure_layout_shortcuts(scene)
         scene.um_show_layout_settings = True
         self.report({'INFO'}, f"已添加: {new_item.name}")
         return {'FINISHED'}

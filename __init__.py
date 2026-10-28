@@ -11,7 +11,14 @@ bl_info = {
 import bpy
 import importlib
 from bpy.types import AddonPreferences
-from bpy.props import BoolProperty, FloatProperty, FloatVectorProperty, IntProperty
+from bpy.props import (
+    BoolProperty,
+    EnumProperty,
+    FloatProperty,
+    FloatVectorProperty,
+    IntProperty,
+    StringProperty,
+)
 
 if "modeling_tools" in locals():
     importlib.reload(workspace)
@@ -44,6 +51,10 @@ if "modeling_tools" in locals():
         importlib.reload(smart_shortcuts)
     else:
         from . import smart_shortcuts
+    if "shortcut_panel" in locals():
+        importlib.reload(shortcut_panel)
+    else:
+        from . import shortcut_panel
     if "model_checker" in locals():
         model_checker.unregister()
         importlib.reload(model_checker.diagnostic)
@@ -68,6 +79,7 @@ else:
     from . import smart_vertex
     from . import smart_edge
     from . import smart_shortcuts
+    from . import shortcut_panel
     from . import model_checker
     from . import ui
     from . import shading_manager
@@ -79,7 +91,16 @@ from .material_manager import MaterialTemplateManager
 class UVMM_AddonPreferences(AddonPreferences):
     bl_idname = __package__
 
+    active_tab: EnumProperty(
+        name="设置页面",
+        items=(
+            ('MATERIAL_LIB', "材质库", "材质模板库管理"),
+            ('SHORTCUTS', "快捷键", "快捷键设置"),
+        ),
+        default='MATERIAL_LIB',
+    )
     model_checker_migrated: BoolProperty(default=False, options={'HIDDEN'})
+    removed_shortcuts: StringProperty(default="", options={'HIDDEN'})
     uv_mode_normalizing: BoolProperty(default=False, options={'HIDDEN', 'SKIP_SAVE'})
     ngon_clear_selection: BoolProperty(name="运行前清除其他选择", default=True, update=model_checker._schedule_preferences_save)
     ngon_sides: IntProperty(name="边数大于", description="顶点数超过此值的面会被选中", default=4, min=3, max=100, update=model_checker._schedule_preferences_save)
@@ -107,24 +128,32 @@ class UVMM_AddonPreferences(AddonPreferences):
 
     def draw(self, context):
         layout = self.layout
-        templates = sorted(MaterialTemplateManager.get_template_names())
-        lib_path = MaterialTemplateManager.get_lib_path()
-        
-        box = layout.box()
-        header = box.row(align=True)
-        header.label(text="材质模板库管理 (跨工程/跨电脑通用)", icon='ASSET_MANAGER')
-        
-        info_col = box.column(align=True)
-        info_col.label(text=f"当前已保存材质模板数量: {len(templates)} 个", icon='MATERIAL')
-        info_col.label(text=f"本地物理库文件路径: {lib_path}", icon='FILE_BLEND')
-        
-        box.separator(factor=0.5)
-        row = box.row(align=True)
-        row.scale_y = 1.2
-        row.operator("material.export_template_library", text="导出材质库 (.blend)", icon='EXPORT')
-        row.operator("material.import_template_library", text="导入材质库 (.blend)", icon='IMPORT')
-        row.operator("material.open_template_library_folder", text="打开存放文件夹", icon='FILE_FOLDER')
+
+        tabs = layout.row(align=True)
+        tabs.scale_y = 1.2
+        tabs.prop(self, "active_tab", expand=True)
         layout.separator()
+
+        if self.active_tab == 'MATERIAL_LIB':
+            templates = sorted(MaterialTemplateManager.get_template_names())
+            lib_path = MaterialTemplateManager.get_lib_path()
+
+            box = layout.box()
+            header = box.row(align=True)
+            header.label(text="材质模板库管理 (跨工程/跨电脑通用)", icon='ASSET_MANAGER')
+
+            info_col = box.column(align=True)
+            info_col.label(text=f"当前已保存材质模板数量: {len(templates)} 个", icon='MATERIAL')
+            info_col.label(text=f"本地物理库文件路径: {lib_path}", icon='FILE_BLEND')
+
+            box.separator(factor=0.5)
+            row = box.row(align=True)
+            row.scale_y = 1.2
+            row.operator("material.export_template_library", text="导出材质库 (.blend)", icon='EXPORT')
+            row.operator("material.import_template_library", text="导入材质库 (.blend)", icon='IMPORT')
+            row.operator("material.open_template_library_folder", text="打开存放文件夹", icon='FILE_FOLDER')
+        elif self.active_tab == 'SHORTCUTS':
+            shortcut_panel.draw_shortcut_preferences(layout, context)
 
 def safe_register_class(cls):
     try:
@@ -159,12 +188,14 @@ def register():
     ui.register()
     shading_manager.register()
     modeling_tools.register()
+    shortcut_panel.register()
     if not bpy.app.timers.is_registered(model_checker.migrate_preferences):
         bpy.app.timers.register(model_checker.migrate_preferences, first_interval=0.2)
     model_checker.register()
 
 # 注销所有模块
 def unregister():
+    shortcut_panel.unregister()
     modeling_tools.unregister()
     model_checker.unregister()
     shading_manager.unregister()

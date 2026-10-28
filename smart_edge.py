@@ -2,7 +2,7 @@
 
 import bpy
 import bmesh
-from bpy.types import Operator
+from bpy.types import Menu, Operator
 
 
 def _is_closed_edge_loop(edges):
@@ -73,6 +73,7 @@ def _connect_selected_verts_to_active(bm, selected_verts):
     staged_bm.verts.ensure_lookup_table()
     try:
         for source_index in source_indices:
+            staged_bm.verts.ensure_lookup_table()
             source = staged_bm.verts[source_index]
             target = staged_bm.verts[active_index]
             if staged_bm.edges.get((source, target)):
@@ -187,7 +188,70 @@ class MESH_OT_uvmm_smart_edge_shortcut(Operator):
         return {'FINISHED'} if 'RUNNING_MODAL' in result else result
 
 
-CLASSES = (MESH_OT_uvmm_smart_edge, MESH_OT_uvmm_smart_edge_shortcut)
+class MESH_OT_uvmm_toggle_sharp(Operator):
+    bl_idname = "mesh.uvmm_toggle_sharp"
+    bl_label = "切换标记锐边"
+    bl_description = "所选边中有普通边时全部标为锐边；全为锐边时全部取消"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == 'EDIT_MESH' and context.edit_object is not None
+
+    def execute(self, context):
+        mesh_edges = []
+        for obj in context.objects_in_mode_unique_data:
+            if obj.type != 'MESH':
+                continue
+            bm = bmesh.from_edit_mesh(obj.data)
+            bm.edges.ensure_lookup_table()
+            selected = [edge for edge in bm.edges if edge.select and not edge.hide]
+            if selected:
+                mesh_edges.append((obj.data, bm, selected))
+
+        if not mesh_edges:
+            self.report({'INFO'}, "请先选择要切换锐边的边")
+            return {'CANCELLED'}
+
+        mark_sharp = any(edge.smooth for _, _, edges in mesh_edges for edge in edges)
+        for mesh, bm, edges in mesh_edges:
+            for edge in edges:
+                edge.smooth = not mark_sharp
+            bm.normal_update()
+            bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
+        self.report({'INFO'}, "已标记锐边" if mark_sharp else "已取消锐边标记")
+        return {'FINISHED'}
+
+
+class MESH_OT_uvmm_toggle_sharp_shortcut(Operator):
+    bl_idname = "mesh.uvmm_toggle_sharp_shortcut"
+    bl_label = "切换标记锐边快捷键分发"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return MESH_OT_uvmm_toggle_sharp.poll(context)
+
+    def execute(self, context):
+        return bpy.ops.mesh.uvmm_toggle_sharp('INVOKE_DEFAULT')
+
+
+class VIEW3D_MT_uvmm_smart_edge_actions(Menu):
+    bl_idname = "VIEW3D_MT_uvmm_smart_edge_actions"
+    bl_label = "智能边功能"
+
+    def draw(self, context):
+        self.layout.operator(MESH_OT_uvmm_toggle_sharp.bl_idname,
+                             text="切换标记锐边", icon='MOD_BEVEL')
+
+
+CLASSES = (
+    MESH_OT_uvmm_smart_edge,
+    MESH_OT_uvmm_smart_edge_shortcut,
+    MESH_OT_uvmm_toggle_sharp,
+    MESH_OT_uvmm_toggle_sharp_shortcut,
+    VIEW3D_MT_uvmm_smart_edge_actions,
+)
 
 
 def register():
@@ -197,9 +261,23 @@ def register():
         except ValueError:
             bpy.utils.unregister_class(cls)
             bpy.utils.register_class(cls)
+    keyconfig = bpy.context.window_manager.keyconfigs.addon
+    if keyconfig is not None:
+        keymap = keyconfig.keymaps.new(name='Mesh', space_type='EMPTY')
+        keymap.keymap_items.new(
+            MESH_OT_uvmm_toggle_sharp.bl_idname,
+            type='TWO', value='PRESS', shift=True, head=True,
+        )
 
 
 def unregister():
+    keyconfig = bpy.context.window_manager.keyconfigs.addon
+    if keyconfig is not None:
+        keymap = keyconfig.keymaps.get('Mesh')
+        if keymap is not None:
+            for item in list(keymap.keymap_items):
+                if item.idname == MESH_OT_uvmm_toggle_sharp.bl_idname:
+                    keymap.keymap_items.remove(item)
     for cls in reversed(CLASSES):
         try:
             bpy.utils.unregister_class(cls)
