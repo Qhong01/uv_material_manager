@@ -8,7 +8,7 @@
   },
   {
     "id": "sh2",
-    "name": "Shader",
+    "name": "着色器",
     "editor_type": "SHADER",
     "direction": "LEFT",
     "ratio": 0.4000000059604645

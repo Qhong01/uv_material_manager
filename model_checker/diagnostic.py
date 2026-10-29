@@ -16,6 +16,7 @@ _DISPLAY_ATTR_KEY = "_model_checker_display_attribute"
 _DISPLAY_SIGNATURE_KEY = "_model_checker_display_signature"
 _DISPLAY_MATRIX_KEY = "_model_checker_display_matrix"
 _COLOR_WRITE_TIME_KEY = "_model_checker_color_write_time"
+_COLOR_ECHO_TOKEN_KEY = "_model_checker_color_echo_token"
 _STATS_STRETCH_KEY = "_model_checker_stats_stretch"
 _STATS_FLIPPED_KEY = "_model_checker_stats_flipped"
 _STATS_MATRIX_KEY = "_model_checker_stats_matrix"
@@ -213,7 +214,17 @@ def _update_edit_mesh_colors(obj, layer_name, display_name, prefs):
         base = _face_base_color(max_stretch[face_index], flipped, prefs)
         for loop in face.loops:
             loop[color_layer] = _loop_display_color(base)
+    # Set the echo guard before the BMesh write as well: depending on the
+    # depsgraph flush point the handler can observe the update synchronously.
+    # The token is an exact monotonic integer string (never a 32-bit RNA float).
+    mesh[_COLOR_ECHO_TOKEN_KEY] = str(time.monotonic_ns())
+    mesh[_COLOR_WRITE_TIME_KEY] = time.monotonic()
     bmesh.update_edit_mesh(mesh, loop_triangles=True, destructive=False)
+    # Edit-mode writes need the same echo guard as object-mode writes: without
+    # it the resulting depsgraph update re-marks the mesh dirty and the checker
+    # rewrites its colours forever, which also invalidated the UV-bounds scan.
+    mesh[_COLOR_WRITE_TIME_KEY] = time.monotonic()
+    mesh[_COLOR_ECHO_TOKEN_KEY] = str(time.monotonic_ns())
     return True
 
 
@@ -471,6 +482,11 @@ def _update_object_mesh_colors(obj, uv_layer, display_attr, prefs, stats_dirty=F
 
         loop_vertices = np.empty(len(mesh.loops), dtype=np.int32)
         mesh.loops.foreach_get("vertex_index", loop_vertices)
+        if len(uv_layer.data) != len(mesh.loops):
+            # A scene switch / save / undo can expose an edit mesh whose UV
+            # layer is momentarily detached; skip this refresh instead of
+            # raising from the timer callback.
+            return True
         uv_values = np.empty(len(mesh.loops) * 2, dtype=np.float32)
         uv_layer.data.foreach_get("uv", uv_values)
         loop_uvs = uv_values.reshape(-1, 2).astype(np.float64)
@@ -911,6 +927,7 @@ def _remove_diagnostic_attributes(mesh):
         _DISPLAY_SIGNATURE_KEY,
         _DISPLAY_MATRIX_KEY,
         _COLOR_WRITE_TIME_KEY,
+        _COLOR_ECHO_TOKEN_KEY,
         _PREVIOUS_COLOR_KEY,
         _PREVIOUS_COLOR_HAD_KEY,
     ):

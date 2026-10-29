@@ -2,6 +2,7 @@
 
 import bpy
 import bmesh
+import types
 from bpy.props import (
     BoolProperty,
     EnumProperty,
@@ -166,32 +167,58 @@ def _visible_meshes(context):
     return diagnostic.visible_meshes(context.scene, context.view_layer)
 
 
-def _select_uv_findings(context, prefs):
-    """Select stretch and flipped faces on every currently visible mesh."""
-    check_stretch = bool(prefs.uv_show_stretch)
-    check_flipped = bool(prefs.uv_show_orientation)
+def _ensure_object_mode(context):
+    """Exit Edit Mode if active, remaining strictly in Object Mode."""
+    if context.mode == 'EDIT_MESH' or (context.active_object and context.active_object.mode == 'EDIT'):
+        if context.view_layer.objects.active is None:
+            for obj in context.view_layer.objects:
+                if obj.mode == 'EDIT':
+                    context.view_layer.objects.active = obj
+                    break
+        if context.view_layer.objects.active and context.view_layer.objects.active.mode == 'EDIT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+
+def _select_uv_findings(context, prefs, feature=None):
+    """Select visible mesh objects with qualifying UV findings without entering Edit Mode."""
+    _ensure_object_mode(context)
+    if feature == 'uv_show_stretch':
+        check_prefs = types.SimpleNamespace(
+            uv_show_stretch=True,
+            uv_show_orientation=False,
+            uv_stretch_threshold=getattr(prefs, 'uv_stretch_threshold', 0.0),
+        )
+    elif feature == 'uv_show_orientation':
+        check_prefs = types.SimpleNamespace(
+            uv_show_stretch=False,
+            uv_show_orientation=True,
+            uv_stretch_threshold=getattr(prefs, 'uv_stretch_threshold', 0.0),
+        )
+    else:
+        check_prefs = prefs
+
+    check_stretch = bool(getattr(check_prefs, 'uv_show_stretch', False))
+    check_flipped = bool(getattr(check_prefs, 'uv_show_orientation', False))
     if not (check_stretch or check_flipped):
         return 0
     mesh_objects = _visible_meshes(context)
     if not mesh_objects:
         return 0
-    if diagnostic.count_uv_findings(mesh_objects, prefs) == 0:
-        return 0
 
-    active = context.view_layer.objects.active
-    if context.mode == 'EDIT_MESH':
-        bpy.ops.object.mode_set(mode='OBJECT')
+    matching_objects = tuple(
+        obj for obj in mesh_objects
+        if diagnostic.count_uv_findings((obj,), check_prefs) > 0
+    )
     for obj in tuple(context.view_layer.objects):
-        if obj.type == 'MESH' and obj.select_get():
+        if obj.select_get():
             obj.select_set(False)
-    for obj in mesh_objects:
+    for obj in matching_objects:
         obj.select_set(True)
-    if active not in mesh_objects:
-        active = mesh_objects[0]
+    active = context.view_layer.objects.active
+    if active not in matching_objects:
+        active = matching_objects[0] if matching_objects else None
     context.view_layer.objects.active = active
-    bpy.ops.object.mode_set(mode='EDIT')
-    context.tool_settings.mesh_select_mode = (False, False, True)
-    return diagnostic.select_uv_findings_in_edit_mode(context.objects_in_mode_unique_data, prefs)
+    return len(matching_objects)
 
 
 def _read_preferences(context):
@@ -407,6 +434,8 @@ class MC_OT_toggle_uv_overlay(bpy.types.Operator):
         if prefs is None:
             self.report({'ERROR'}, "模型检查插件设置不可用")
             return {'CANCELLED'}
+        if self.enabled and self.feature in {'uv_show_stretch', 'uv_show_orientation'}:
+            _ensure_object_mode(context)
         setting_names = _UV_FEATURE_SETTINGS[self.feature]
         _copy_operator_to_preferences(self, prefs, setting_names)
         previous_value = getattr(prefs, self.feature)
@@ -428,14 +457,14 @@ class MC_OT_toggle_uv_overlay(bpy.types.Operator):
             state = context.scene.model_checker_state
             state.refresh_in_progress = True
             try:
-                found_faces = _select_uv_findings(context, prefs)
+                found_objects = _select_uv_findings(context, prefs, feature=self.feature)
             except RuntimeError as exc:
                 setattr(prefs, self.feature, previous_value)
-                self.report({'ERROR'}, f"无法选择 UV 问题面：{exc}")
+                self.report({'ERROR'}, f"无法选择 UV 问题物体：{exc}")
                 return {'CANCELLED'}
             finally:
                 state.refresh_in_progress = False
-            self.report({'INFO'}, f"已在可见模型中选中 {found_faces} 个 UV 问题面")
+            self.report({'INFO'}, f"已在物体模式下选中 {found_objects} 个含 UV 问题的物体")
         _tag_viewports(context)
         return {'FINISHED'}
 

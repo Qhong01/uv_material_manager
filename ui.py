@@ -428,6 +428,19 @@ class IMAGE_PT_UVManager(Panel):
         VIEW3D_PT_UVLayerManager.draw(self, context)
 
 
+# UV检查面板（UV 编辑器侧边栏）
+class IMAGE_PT_UVCheck(Panel):
+    bl_label = "检查"
+    bl_space_type = 'IMAGE_EDITOR'
+    bl_region_type = 'UI'
+    bl_category = "UV Tools"
+    bl_order = 2
+
+    def draw(self, context):
+        from .uv_bounds_checker import draw_uv_bounds_check_panel
+        draw_uv_bounds_check_panel(self, context)
+
+
 # 材质管理面板
 class VIEW3D_PT_MaterialManager(Panel):
     bl_label = "材质管理"
@@ -575,11 +588,13 @@ def register():
     bpy.utils.register_class(VIEW3D_PT_ModifierManager)
     bpy.utils.register_class(VIEW3D_PT_UVLayerManager)
     bpy.utils.register_class(IMAGE_PT_UVManager)
+    bpy.utils.register_class(IMAGE_PT_UVCheck)
     bpy.utils.register_class(VIEW3D_PT_MaterialManager)
 
 # 注销函数
 def unregister():
     bpy.utils.unregister_class(VIEW3D_PT_MaterialManager)
+    bpy.utils.unregister_class(IMAGE_PT_UVCheck)
     bpy.utils.unregister_class(IMAGE_PT_UVManager)
     bpy.utils.unregister_class(VIEW3D_PT_UVLayerManager)
     bpy.utils.unregister_class(VIEW3D_PT_ModifierManager)

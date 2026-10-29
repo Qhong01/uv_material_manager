@@ -164,7 +164,21 @@ def _ensure_item(window_manager, spec, allow_unassigned=False,
         if _matching_item(user, name, operator_id, properties)[1] is not None:
             return
     space_type = 'VIEW_3D' if name == '3D View' else 'EMPTY'
-    km = config.keymaps.new(name=name, space_type=space_type, region_type='WINDOW')
+    km = config.keymaps.get(name)
+    if km is None:
+        km = config.keymaps.new(name=name, space_type=space_type, region_type='WINDOW')
+        # Never leave a freshly created user keymap empty: it would shadow the
+        # base keyconfig and silently drop every default shortcut in it
+        # (Ctrl+Z, Ctrl+Space, ...).
+        if config is user:
+            source = (window_manager.keyconfigs.active
+                      or window_manager.keyconfigs.default).keymaps.get(name)
+            if source is not None:
+                for source_item in source.keymap_items:
+                    try:
+                        km.keymap_items.new_from_item(source_item)
+                    except (AttributeError, RuntimeError, TypeError):
+                        break
     kmi = km.keymap_items.new(operator_id, key, 'PRESS', head=True, **modifiers)
     for prop, value in properties.items():
         setattr(kmi.properties, prop, value)

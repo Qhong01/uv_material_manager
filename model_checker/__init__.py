@@ -234,9 +234,10 @@ def _update_boundary_width(self, context):
 def _restore_overlay_settings(_dummy):
     addon = bpy.context.preferences.addons.get(ADDON_ID)
     if addon is not None:
-        _init_checker_density_key(addon.preferences)
-        _enforce_uv_display_exclusivity(addon.preferences)
-        _sync_all_scenes(addon.preferences)
+        prefs = addon.preferences
+        _init_checker_density_key(prefs)
+        _enforce_uv_display_exclusivity(prefs)
+        _sync_all_scenes(prefs)
         diagnostic.start_refresh_timer()
 
 
@@ -469,9 +470,22 @@ def _initialize_after_register():
     _migrate_overlay_opacity_defaults()
     addon = bpy.context.preferences.addons.get(ADDON_ID)
     if addon is not None:
-        _init_checker_density_key(addon.preferences)
-        _enforce_uv_display_exclusivity(addon.preferences)
-        _sync_all_scenes(addon.preferences)
+        prefs = addon.preferences
+        needs_save = any((
+            prefs.uv_show_stretch,
+            prefs.uv_show_boundaries,
+            prefs.uv_show_checker,
+            prefs.uv_show_orientation,
+        ))
+        prefs.uv_show_stretch = False
+        prefs.uv_show_boundaries = False
+        prefs.uv_show_checker = False
+        prefs.uv_show_orientation = False
+        if needs_save:
+            _schedule_preferences_save()
+        _init_checker_density_key(prefs)
+        _enforce_uv_display_exclusivity(prefs)
+        _sync_all_scenes(prefs)
         diagnostic.start_refresh_timer()
     return None
 

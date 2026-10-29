@@ -64,6 +64,11 @@ if "modeling_tools" in locals():
         importlib.reload(model_checker)
     else:
         from . import model_checker
+    if "uv_bounds_checker" in locals():
+        uv_bounds_checker.unregister()
+        importlib.reload(uv_bounds_checker)
+    else:
+        from . import uv_bounds_checker
     importlib.reload(ui)
     importlib.reload(shading_manager)
     importlib.reload(modeling_tools)
@@ -81,6 +86,7 @@ else:
     from . import smart_shortcuts
     from . import shortcut_panel
     from . import model_checker
+    from . import uv_bounds_checker
     from . import ui
     from . import shading_manager
     from . import modeling_tools
@@ -202,6 +208,7 @@ def register():
     smart_vertex.register()
     smart_edge.register()
     smart_shortcuts.register()
+    uv_bounds_checker.register()
     ui.register()
     shading_manager.register()
     modeling_tools.register()
@@ -217,6 +224,7 @@ def unregister():
     model_checker.unregister()
     shading_manager.unregister()
     ui.unregister()
+    uv_bounds_checker.unregister()
     focus_tools.unregister()
     smart_shortcuts.unregister()
     smart_edge.unregister()
