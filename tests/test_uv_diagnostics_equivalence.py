@@ -8,6 +8,7 @@
 import unittest
 
 import bpy
+import bmesh
 from mathutils import Vector
 
 from uv_material_manager.model_checker import diagnostic
@@ -69,16 +70,41 @@ def _scalar_reference(obj, prefs):
             flipped_votes[polygon_index] += 1
         triangle_counts[polygon_index] += 1
 
-    reference = [None] * len(mesh.loops)
+    face_colors = [None] * len(mesh.polygons)
     for polygon in mesh.polygons:
         index = polygon.index
         flipped = (
             triangle_counts[index] > 0
             and flipped_votes[index] * 2 >= triangle_counts[index]
         )
-        base = diagnostic._face_base_color(max_stretch[index], flipped, prefs)
-        for loop_index in polygon.loop_indices:
-            reference[loop_index] = (*base, 1.0)
+        face_colors[index] = diagnostic._face_base_color(max_stretch[index], flipped, prefs)
+
+    reference = [None] * len(mesh.loops)
+    if prefs.uv_show_stretch:
+        point_sums = [[0.0, 0.0, 0.0] for _ in mesh.vertices]
+        point_counts = [0] * len(mesh.vertices)
+        for polygon in mesh.polygons:
+            color = face_colors[polygon.index]
+            for vertex_index in polygon.vertices:
+                for channel in range(3):
+                    point_sums[vertex_index][channel] += color[channel]
+                point_counts[vertex_index] += 1
+
+        point_colors = []
+        for vertex_index, sums in enumerate(point_sums):
+            count = point_counts[vertex_index]
+            point_colors.append(
+                tuple(value / count for value in sums)
+                if count
+                else (0.38, 0.38, 0.38)
+            )
+        for loop in mesh.loops:
+            reference[loop.index] = (*point_colors[loop.vertex_index], 1.0)
+    else:
+        for polygon in mesh.polygons:
+            base = face_colors[polygon.index]
+            for loop_index in polygon.loop_indices:
+                reference[loop_index] = (*base, 1.0)
     return reference
 
 
@@ -88,6 +114,11 @@ def _actual_colors(obj):
     assert name, "诊断颜色属性没有创建"
     attribute = mesh.color_attributes.get(name)
     assert attribute is not None
+    if attribute.domain == 'POINT':
+        return [
+            tuple(attribute.data[loop.vertex_index].color)
+            for loop in mesh.loops
+        ]
     return [tuple(attribute.data[index].color) for index in range(len(mesh.loops))]
 
 
@@ -117,12 +148,84 @@ def test_stretch_matches_scalar_reference(ctx):
         _set_mode()
 
 
+def test_stretch_display_attribute_is_point_domain_and_smooth(ctx):
+    _set_mode(stretch=True)
+    try:
+        obj = _prepare(ctx, distort=True)
+        diagnostic._ensure_preview(obj, _prefs(), force_update=True)
+        name = obj.data.get("_model_checker_display_attribute")
+        attribute = obj.data.color_attributes.get(name)
+        assert attribute is not None
+        assert attribute.domain == 'POINT'
+        point_colors = {
+            tuple(round(channel, 4) for channel in item.color[:3])
+            for item in attribute.data
+        }
+        assert len(point_colors) > 2, "拉伸颜色应在相邻点之间形成渐变"
+    finally:
+        _set_mode()
+
+
+def test_stretch_switches_corner_attribute_to_point_in_edit_mode(ctx):
+    _set_mode(orientation=True)
+    obj = _prepare(ctx, distort=True)
+    prefs = _prefs()
+    try:
+        diagnostic._ensure_preview(obj, prefs, force_update=True)
+        name = obj.data.get("_model_checker_display_attribute")
+        attribute = obj.data.color_attributes.get(name)
+        assert attribute is not None and attribute.domain == 'CORNER'
+
+        ctx.activate(obj)
+        ctx.set_mode('EDIT')
+        prefs.uv_show_orientation = False
+        prefs.uv_show_stretch = True
+        diagnostic._ensure_preview(obj, prefs, force_update=True)
+
+        bm = bmesh.from_edit_mesh(obj.data)
+        point_layer = bm.verts.layers.float_color.get(name)
+        assert point_layer is not None, "编辑模式下应创建点域浮点颜色层"
+        point_colors = {
+            tuple(round(float(channel), 4) for channel in vert[point_layer][:3])
+            for vert in bm.verts
+        }
+        assert len(point_colors) > 2, "编辑模式的拉伸颜色应在顶点间形成渐变"
+    finally:
+        ctx.object_mode()
+        _set_mode()
+
+    attribute = obj.data.color_attributes.get(name)
+    assert attribute is not None and attribute.domain == 'POINT'
+
+
 def test_orientation_matches_scalar_reference(ctx):
     _set_mode(orientation=True)
     try:
         obj = _prepare(ctx, distort=True, flip=True)
         _assert_matches(obj)
     finally:
+        _set_mode()
+
+
+def test_orientation_opacity_changes_display_color(ctx):
+    _set_mode(orientation=True)
+    prefs = _prefs()
+    original_opacity = prefs.uv_orientation_opacity
+    try:
+        obj = _prepare(ctx, distort=True)
+        prefs.uv_orientation_opacity = 1.0
+        diagnostic._ensure_preview(obj, prefs, force_update=True)
+        name = obj.data.get("_model_checker_display_attribute")
+        attribute = obj.data.color_attributes.get(name)
+        assert attribute is not None and attribute.domain == 'CORNER'
+        full_strength = tuple(attribute.data[0].color)
+
+        prefs.uv_orientation_opacity = 0.25
+        diagnostic._ensure_preview(obj, prefs, force_update=False)
+        reduced_strength = tuple(attribute.data[0].color)
+        assert reduced_strength != full_strength, "正反颜色透明度滑块应改变显示颜色强度"
+    finally:
+        prefs.uv_orientation_opacity = original_opacity
         _set_mode()
 
 

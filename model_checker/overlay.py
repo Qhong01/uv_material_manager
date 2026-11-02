@@ -2,6 +2,7 @@
 
 import bpy
 import bmesh
+import blf
 import gpu
 import time
 from gpu_extras.batch import batch_for_shader
@@ -9,7 +10,10 @@ from mathutils import Vector
 from bpy.app.handlers import persistent
 
 _DRAW_HANDLE = None
+_FEEDBACK_DRAW_HANDLE = None
+_FEEDBACK_SHADER = None
 _DRAW_CACHE = {}
+_FEEDBACK_DURATION = 4.5
 
 
 def _active_uv_layer(obj, bm):
@@ -127,6 +131,102 @@ def _draw_overlay():
         gpu.state.blend_set('NONE')
 
 
+def _draw_check_feedback():
+    global _FEEDBACK_SHADER
+    context = bpy.context
+    scene = context.scene
+    region = context.region
+    if scene is None or region is None or not hasattr(scene, "model_checker_state"):
+        return
+    state = scene.model_checker_state
+    message = state.check_feedback_message
+    if not message or time.monotonic() >= state.check_feedback_until:
+        return
+
+    font_id = 0
+    blf.size(font_id, 14)
+    text_width, text_height = blf.dimensions(font_id, message)
+    padding_x = 14
+    padding_y = 10
+    margin = 18
+    max_width = max(80, region.width - margin * 2)
+    box_width = min(text_width + padding_x * 2, max_width)
+    box_height = max(36, text_height + padding_y * 2)
+    x = max(margin, (region.width - box_width) * 0.5)
+    y = margin * 2 + 4
+    vertices = (
+        (x, y),
+        (x + box_width, y),
+        (x, y + box_height),
+        (x + box_width, y + box_height),
+    )
+    indices = ((0, 1, 2), (2, 1, 3))
+    shader = _FEEDBACK_SHADER
+    if shader is None:
+        shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+        _FEEDBACK_SHADER = shader
+    batch = batch_for_shader(shader, 'TRIS', {"pos": vertices}, indices=indices)
+    background = (
+        (0.07, 0.25, 0.46, 0.94)
+        if state.check_feedback_level == 'INFO'
+        else (0.50, 0.25, 0.04, 0.96)
+    )
+    previous_blend = gpu.state.blend_get()
+    try:
+        gpu.state.blend_set('ALPHA')
+        shader.bind()
+        shader.uniform_float("color", background)
+        batch.draw(shader)
+        blf.position(font_id, x + padding_x, y + padding_y, 0)
+        blf.color(font_id, 1.0, 1.0, 1.0, 1.0)
+        blf.draw(font_id, message)
+    finally:
+        gpu.state.blend_set(previous_blend)
+
+
+def _check_feedback_timer():
+    now = time.monotonic()
+    visible = False
+    for scene in bpy.data.scenes:
+        if not hasattr(scene, "model_checker_state"):
+            continue
+        state = scene.model_checker_state
+        if not state.check_feedback_message:
+            continue
+        if now >= state.check_feedback_until:
+            state.check_feedback_message = ""
+            state.check_feedback_until = 0.0
+            state.check_feedback_level = 'INFO'
+        else:
+            visible = True
+
+    window_manager = bpy.context.window_manager
+    if window_manager is not None:
+        for window in window_manager.windows:
+            if window.screen is None:
+                continue
+            for area in window.screen.areas:
+                if area.type == 'VIEW_3D':
+                    area.tag_redraw()
+    return 0.2 if visible else None
+
+
+def show_check_feedback(context, message, level='INFO'):
+    scene = context.scene
+    if scene is None or not hasattr(scene, "model_checker_state"):
+        return
+    state = scene.model_checker_state
+    state.check_feedback_message = str(message)
+    state.check_feedback_level = level if level in {'INFO', 'WARNING'} else 'INFO'
+    state.check_feedback_until = time.monotonic() + _FEEDBACK_DURATION
+    if context.screen is not None:
+        for area in context.screen.areas:
+            if area.type == 'VIEW_3D':
+                area.tag_redraw()
+    if not bpy.app.timers.is_registered(_check_feedback_timer):
+        bpy.app.timers.register(_check_feedback_timer, first_interval=0.2)
+
+
 def _overlay_signature(mode, objects, state):
     object_signature = []
     for obj in objects:
@@ -170,7 +270,7 @@ def _invalidate_overlay_cache(scene, depsgraph):
     if state.refresh_in_progress:
         return
     changed_meshes = set()
-    transformed_meshes = set()
+    transformed_objects = {}
     for update in depsgraph.updates:
         updated_id = update.id.original or update.id
         if isinstance(updated_id, bpy.types.Mesh):
@@ -180,8 +280,8 @@ def _invalidate_overlay_cache(scene, depsgraph):
             if update.is_updated_geometry:
                 changed_meshes.add(updated_id.data)
             if update.is_updated_transform:
-                transformed_meshes.add(updated_id.data)
-    if not changed_meshes and not transformed_meshes:
+                transformed_objects.setdefault(updated_id.data, []).append(updated_id)
+    if not changed_meshes and not transformed_objects:
         return
 
     state.overlay_cache_dirty = True
@@ -189,17 +289,35 @@ def _invalidate_overlay_cache(scene, depsgraph):
         return
 
     from . import diagnostic
-    if state.uv_show_checker:
-        diagnostic.mark_full_refresh(state)
-        needs_refresh = True
-    else:
-        needs_refresh = False
-        for mesh in changed_meshes | transformed_meshes:
-            needs_refresh = diagnostic.mark_mesh_dirty(
-                state,
+    needs_refresh = False
+    for mesh in changed_meshes:
+        needs_refresh = diagnostic.mark_mesh_dirty(
+            state,
+            mesh,
+            force=state.uv_show_checker,
+            transform_only=False,
+        ) or needs_refresh
+    for mesh, objects in transformed_objects.items():
+        if mesh in changed_meshes or not state.uv_show_stretch:
+            # Orientation and checker output do not depend on object transforms.
+            continue
+        requires_refresh = any(
+            diagnostic.transform_requires_stretch_refresh(
                 mesh,
-                force=mesh in transformed_meshes,
-            ) or needs_refresh
+                tuple(value for row in obj.matrix_world for value in row),
+                state.uv_show_stretch,
+            )
+            for obj in objects
+        )
+        if not requires_refresh:
+            continue
+        needs_refresh = diagnostic.mark_mesh_dirty(
+            state,
+            mesh,
+            force=True,
+            transform_only=True,
+        ) or needs_refresh
+        state.uv_display_defer_until = time.monotonic() + 0.15
     if needs_refresh:
         if bpy.context.mode == 'EDIT_MESH':
             state.uv_display_defer_until = time.monotonic() + 0.6
@@ -212,22 +330,38 @@ def _clear_overlay_cache(_dummy):
 
 
 def register_draw_handler():
-    global _DRAW_HANDLE
+    global _DRAW_HANDLE, _FEEDBACK_DRAW_HANDLE
     if _invalidate_overlay_cache not in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.append(_invalidate_overlay_cache)
     if _clear_overlay_cache not in bpy.app.handlers.load_pre:
         bpy.app.handlers.load_pre.append(_clear_overlay_cache)
     if _DRAW_HANDLE is None:
         _DRAW_HANDLE = bpy.types.SpaceView3D.draw_handler_add(_draw_overlay, (), 'WINDOW', 'POST_VIEW')
+    if _FEEDBACK_DRAW_HANDLE is None:
+        _FEEDBACK_DRAW_HANDLE = bpy.types.SpaceView3D.draw_handler_add(
+            _draw_check_feedback, (), 'WINDOW', 'POST_PIXEL',
+        )
 
 
 def unregister_draw_handler():
-    global _DRAW_HANDLE
+    global _DRAW_HANDLE, _FEEDBACK_DRAW_HANDLE, _FEEDBACK_SHADER
     if _invalidate_overlay_cache in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.remove(_invalidate_overlay_cache)
     if _clear_overlay_cache in bpy.app.handlers.load_pre:
         bpy.app.handlers.load_pre.remove(_clear_overlay_cache)
     _DRAW_CACHE.clear()
+    if bpy.app.timers.is_registered(_check_feedback_timer):
+        bpy.app.timers.unregister(_check_feedback_timer)
+    for scene in bpy.data.scenes:
+        if hasattr(scene, "model_checker_state"):
+            state = scene.model_checker_state
+            state.check_feedback_message = ""
+            state.check_feedback_until = 0.0
+            state.check_feedback_level = 'INFO'
     if _DRAW_HANDLE is not None:
         bpy.types.SpaceView3D.draw_handler_remove(_DRAW_HANDLE, 'WINDOW')
         _DRAW_HANDLE = None
+    if _FEEDBACK_DRAW_HANDLE is not None:
+        bpy.types.SpaceView3D.draw_handler_remove(_FEEDBACK_DRAW_HANDLE, 'WINDOW')
+        _FEEDBACK_DRAW_HANDLE = None
+    _FEEDBACK_SHADER = None

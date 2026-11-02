@@ -3,7 +3,7 @@
     "show_region_ui": true,
     "show_region_toolbar": false,
     "active_panel_category": "UVPackmaster4",
-    "use_image_pin": false
+    "use_image_pin": true
   },
   "SHADER": {
     "show_region_ui": false,
@@ -24,13 +24,13 @@
     "show_region_ui": true,
     "show_region_toolbar": true,
     "browse_mode": "ASSETS",
-    "asset_library_reference": "ALL",
-    "catalog_id": "0603d3f2-7688-4747-983b-b50cb6572439",
+    "asset_library_reference": "ZIYUAN",
+    "catalog_id": "645d0562-c941-4f3a-81ec-c0de72702241",
     "active_panel_category": "",
     "import_method": "FOLLOW_PREFS",
     "display_type": "THUMBNAIL",
     "filter_search": "",
-    "directory": ""
+    "directory": "C:\\Users\\xiaohong\\AppData\\Roaming\\Blender Foundation\\Blender\\5.2\\scripts\\presets\\ZIYUAN\\"
   },
   "FILES": {
     "show_region_ui": false,
@@ -69,7 +69,7 @@
     "show_region_ui": true,
     "show_region_toolbar": false,
     "active_panel_category": "UVPackmaster4",
-    "use_image_pin": false
+    "use_image_pin": true
   },
   "sh2": {
     "show_region_ui": false,
@@ -80,12 +80,12 @@
     "show_region_ui": true,
     "show_region_toolbar": true,
     "browse_mode": "ASSETS",
-    "asset_library_reference": "ALL",
-    "catalog_id": "0603d3f2-7688-4747-983b-b50cb6572439",
+    "asset_library_reference": "ZIYUAN",
+    "catalog_id": "645d0562-c941-4f3a-81ec-c0de72702241",
     "import_method": "FOLLOW_PREFS",
     "display_type": "THUMBNAIL",
     "filter_search": "",
-    "directory": ""
+    "directory": "C:\\Users\\xiaohong\\AppData\\Roaming\\Blender Foundation\\Blender\\5.2\\scripts\\presets\\ZIYUAN\\"
   },
   "IMAGE_EDITOR": {
     "show_region_ui": false,

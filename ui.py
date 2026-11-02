@@ -157,6 +157,9 @@ class VIEW3D_PT_UltimateManager(Panel):
         focus_row.operator("mesh.uvmm_smart_vertex", text="智能顶点", icon='VERTEXSEL')
         focus_row.operator("mesh.uvmm_smart_edge", text="智能边", icon='EDGESEL')
         focus_row.menu("VIEW3D_MT_uvmm_smart_edge_actions", text="", icon='DOWNARROW_HLT')
+        focus_row.operator("uvmm.clean_duplicate_images", text="", icon='IMAGE_DATA')
+        focus_row.operator("uvmm.clean_duplicate_materials", text="", icon='BRUSH_DATA')
+        focus_row.operator("uvmm.merge_materials_by_name", text="", icon='SORTALPHA')
 
         # 1. 动态自定义分屏工具栏 (第三排：只放分屏功能按键，右侧保留配置齿轮)
         from .workspace import get_editor_icon

@@ -10,6 +10,7 @@ bl_info = {
 
 import bpy
 import importlib
+import addon_utils
 from bpy.types import AddonPreferences
 from bpy.props import (
     BoolProperty,
@@ -20,7 +21,18 @@ from bpy.props import (
     StringProperty,
 )
 
+_restore_addon_after_module_reload = (
+    "modeling_tools" in locals()
+    and addon_utils.check(__package__)[1]
+)
+
 if "modeling_tools" in locals():
+    # Keep Blender's registered classes bound to their original Python class
+    # objects until they are unregistered. Reloading modules first replaces
+    # those objects and makes their later unregister_class() calls fail.
+    if _restore_addon_after_module_reload:
+        unregister()
+
     importlib.reload(workspace)
     importlib.reload(utils)
     importlib.reload(uv_manager)
@@ -46,8 +58,11 @@ if "modeling_tools" in locals():
         importlib.reload(smart_edge)
     else:
         from . import smart_edge
+    if "data_cleanup" in locals():
+        importlib.reload(data_cleanup)
+    else:
+        from . import data_cleanup
     if "smart_shortcuts" in locals():
-        smart_shortcuts.unregister()
         importlib.reload(smart_shortcuts)
     else:
         from . import smart_shortcuts
@@ -56,7 +71,6 @@ if "modeling_tools" in locals():
     else:
         from . import shortcut_panel
     if "model_checker" in locals():
-        model_checker.unregister()
         importlib.reload(model_checker.diagnostic)
         importlib.reload(model_checker.overlay)
         importlib.reload(model_checker.operators)
@@ -65,7 +79,6 @@ if "modeling_tools" in locals():
     else:
         from . import model_checker
     if "uv_bounds_checker" in locals():
-        uv_bounds_checker.unregister()
         importlib.reload(uv_bounds_checker)
     else:
         from . import uv_bounds_checker
@@ -83,6 +96,7 @@ else:
     from . import focus_tools
     from . import smart_vertex
     from . import smart_edge
+    from . import data_cleanup
     from . import smart_shortcuts
     from . import shortcut_panel
     from . import model_checker
@@ -105,6 +119,19 @@ class UVMM_AddonPreferences(AddonPreferences):
         ),
         default='MATERIAL_LIB',
     )
+    threshold: FloatProperty(
+        name="相似参数阈值",
+        description="按原 M-Cleaner 材质参数比较阈值",
+        default=0.01,
+        min=0.0,
+        precision=4,
+        step=0.1,
+    )
+    node_groups_as_nodes: BoolProperty(
+        name="节点组作为节点比较",
+        description="不展开节点组内部进行比较",
+        default=False,
+    )
     model_checker_migrated: BoolProperty(default=False, options={'HIDDEN'})
     removed_shortcuts: StringProperty(default="", options={'HIDDEN'})
     uv_mode_normalizing: BoolProperty(default=False, options={'HIDDEN', 'SKIP_SAVE'})
@@ -113,7 +140,7 @@ class UVMM_AddonPreferences(AddonPreferences):
     uv_show_stretch: BoolProperty(name="显示 UV 拉伸", default=False, update=model_checker._update_scene_overlay)
     uv_stretch_opacity: FloatProperty(name="热力图透明度", default=0.85, min=0.0, max=1.0, update=model_checker._update_scene_overlay)
     uv_stretch_base_color: FloatVectorProperty(name="无拉伸颜色", subtype='COLOR', size=3, default=(0.43, 0.78, 1.0), min=0.0, max=1.0, update=model_checker._update_scene_overlay)
-    uv_stretch_max_color: FloatVectorProperty(name="拉伸颜色", subtype='COLOR', size=3, default=(0.72, 0.34, 0.025), min=0.0, max=1.0, update=model_checker._update_scene_overlay)
+    uv_stretch_max_color: FloatVectorProperty(name="拉伸颜色", subtype='COLOR', size=3, default=(1.0, 0.0, 0.0), min=0.0, max=1.0, update=model_checker._update_scene_overlay)
     uv_stretch_strength: FloatProperty(name="拉伸显示强度", description="提高后较轻微的拉伸也会有更明显的颜色变化", default=2.0, min=0.25, max=8.0, update=model_checker._update_scene_overlay)
     uv_stretch_threshold: FloatProperty(name="可接受拉伸阈值", description="低于此阈值的拉伸按无拉伸颜色显示", default=0.0, min=0.0, max=0.999, subtype='PERCENTAGE', update=model_checker._update_scene_overlay)
     uv_show_boundaries: BoolProperty(name="显示 UV 分界边", default=False, update=model_checker._update_scene_overlay)
@@ -175,6 +202,11 @@ class UVMM_AddonPreferences(AddonPreferences):
             row.operator("material.export_template_library", text="导出材质库 (.blend)", icon='EXPORT')
             row.operator("material.import_template_library", text="导入材质库 (.blend)", icon='IMPORT')
             row.operator("material.open_template_library_folder", text="打开存放文件夹", icon='FILE_FOLDER')
+
+            cleanup_box = layout.box()
+            cleanup_box.label(text="材质清理设置", icon='BRUSH_DATA')
+            cleanup_box.prop(self, "threshold", text="相似参数阈值")
+            cleanup_box.prop(self, "node_groups_as_nodes", text="节点组作为节点比较")
         elif self.active_tab == 'SHORTCUTS':
             shortcut_panel.draw_shortcut_preferences(layout, context)
 
@@ -207,6 +239,7 @@ def register():
     focus_tools.register()
     smart_vertex.register()
     smart_edge.register()
+    data_cleanup.register()
     smart_shortcuts.register()
     uv_bounds_checker.register()
     ui.register()
@@ -227,6 +260,7 @@ def unregister():
     uv_bounds_checker.unregister()
     focus_tools.unregister()
     smart_shortcuts.unregister()
+    data_cleanup.unregister()
     smart_edge.unregister()
     smart_vertex.unregister()
     quick_mirror.unregister()
@@ -239,4 +273,7 @@ def unregister():
     safe_unregister_class(UVMM_AddonPreferences)
 
 if __name__ == "__main__":
+    register()
+
+if _restore_addon_after_module_reload:
     register()

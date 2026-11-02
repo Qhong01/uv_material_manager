@@ -275,17 +275,28 @@ class MC_PG_mesh_state(bpy.types.PropertyGroup):
 class MC_PG_scene_state(bpy.types.PropertyGroup):
     """Per-file runtime state used by the viewport overlay."""
 
+    check_feedback_message: StringProperty(default="", options={'SKIP_SAVE'})
+    check_feedback_level: EnumProperty(
+        items=(
+            ('INFO', "信息", ""),
+            ('WARNING', "提醒", ""),
+        ),
+        default='INFO',
+        options={'SKIP_SAVE'},
+    )
+    check_feedback_until: FloatProperty(default=0.0, options={'SKIP_SAVE'})
     overlay_active: BoolProperty(default=False, options={'SKIP_SAVE'})
     overlay_cache_dirty: BoolProperty(default=True, options={'SKIP_SAVE'})
     uv_display_dirty: BoolProperty(default=True, options={'SKIP_SAVE'})
     uv_display_full_refresh: BoolProperty(default=True, options={'SKIP_SAVE'})
+    uv_display_refresh_cursor: IntProperty(default=0, options={'SKIP_SAVE'})
     uv_display_defer_until: FloatProperty(default=0.0, options={'SKIP_SAVE'})
     uv_mesh_states: CollectionProperty(type=MC_PG_mesh_state, options={'SKIP_SAVE'})
     refresh_in_progress: BoolProperty(default=False, options={'SKIP_SAVE'})
     uv_show_stretch: BoolProperty(default=False, options={'SKIP_SAVE'})
     uv_stretch_opacity: FloatProperty(default=0.85, min=0.0, max=1.0, options={'SKIP_SAVE'})
     uv_stretch_base_color: FloatVectorProperty(size=3, subtype='COLOR', default=(0.43, 0.78, 1.0), min=0.0, max=1.0, options={'SKIP_SAVE'})
-    uv_stretch_max_color: FloatVectorProperty(size=3, subtype='COLOR', default=(0.72, 0.34, 0.025), min=0.0, max=1.0, options={'SKIP_SAVE'})
+    uv_stretch_max_color: FloatVectorProperty(size=3, subtype='COLOR', default=(1.0, 0.0, 0.0), min=0.0, max=1.0, options={'SKIP_SAVE'})
     uv_stretch_strength: FloatProperty(default=2.0, min=0.25, max=8.0, options={'SKIP_SAVE'})
     uv_stretch_threshold: FloatProperty(default=0.0, min=0.0, max=0.999, subtype='PERCENTAGE', options={'SKIP_SAVE'})
     uv_show_boundaries: BoolProperty(default=False, options={'SKIP_SAVE'})
@@ -337,7 +348,7 @@ class MC_AddonPreferences(bpy.types.AddonPreferences):
     uv_show_stretch: BoolProperty(name="显示 UV 拉伸", default=False, update=_update_scene_overlay)
     uv_stretch_opacity: FloatProperty(name="热力图透明度", default=0.85, min=0.0, max=1.0, update=_update_scene_overlay)
     uv_stretch_base_color: FloatVectorProperty(name="无拉伸颜色", subtype='COLOR', size=3, default=(0.43, 0.78, 1.0), min=0.0, max=1.0, update=_update_scene_overlay)
-    uv_stretch_max_color: FloatVectorProperty(name="拉伸颜色", subtype='COLOR', size=3, default=(0.72, 0.34, 0.025), min=0.0, max=1.0, update=_update_scene_overlay)
+    uv_stretch_max_color: FloatVectorProperty(name="拉伸颜色", subtype='COLOR', size=3, default=(1.0, 0.0, 0.0), min=0.0, max=1.0, update=_update_scene_overlay)
     uv_stretch_strength: FloatProperty(name="拉伸显示强度", description="提高后较轻微的拉伸也会有更明显的颜色变化", default=2.0, min=0.25, max=8.0, update=_update_scene_overlay)
     uv_stretch_threshold: FloatProperty(name="可接受拉伸阈值", description="低于此阈值的拉伸按无拉伸颜色显示", default=0.0, min=0.0, max=0.999, subtype='PERCENTAGE', update=_update_scene_overlay)
     uv_show_boundaries: BoolProperty(name="显示 UV 分界边", default=False, update=_update_scene_overlay)
@@ -422,7 +433,11 @@ def _migrate_overlay_opacity_defaults():
         return
     prefs = addon.preferences
     _enforce_uv_display_exclusivity(prefs)
-    if prefs.uv_overlay_tuning_version >= 3:
+    if prefs.uv_overlay_tuning_version >= 6:
+        return
+    if prefs.uv_overlay_tuning_version >= 4:
+        prefs.uv_stretch_base_color = tuple(prefs.uv_orientation_front_color)
+        prefs.uv_overlay_tuning_version = 6
         return
     # Raise only old defaults; preserve custom opacity values.
     if prefs.uv_overlay_tuning_version < 2:
@@ -436,7 +451,11 @@ def _migrate_overlay_opacity_defaults():
         prefs.uv_checker_opacity = 0.75
     if abs(prefs.uv_orientation_opacity - 0.18) < 1e-6:
         prefs.uv_orientation_opacity = 0.9
-    prefs.uv_overlay_tuning_version = 3
+    old_max = (0.72, 0.34, 0.025)
+    prefs.uv_stretch_base_color = tuple(prefs.uv_orientation_front_color)
+    if all(abs(a - b) < 1e-6 for a, b in zip(prefs.uv_stretch_max_color, old_max)):
+        prefs.uv_stretch_max_color = (1.0, 0.0, 0.0)
+    prefs.uv_overlay_tuning_version = 6
 
 
 def migrate_preferences():

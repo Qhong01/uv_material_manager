@@ -12,7 +12,7 @@ from bpy.props import (
     StringProperty,
 )
 
-from . import diagnostic
+from . import diagnostic, overlay
 
 ADDON_ID = __package__.split('.')[0]
 
@@ -58,6 +58,22 @@ def _clear_selection(bm):
         edge.select_set(False)
     for vertex in bm.verts:
         vertex.select_set(False)
+
+
+def _selection_mode_for_findings(check_ngons, check_isolated):
+    if check_ngons and check_isolated:
+        return (True, False, True)
+    if check_ngons:
+        return (False, False, True)
+    if check_isolated:
+        return (True, False, False)
+    return (True, True, True)
+
+
+def _check_result_message(check_name, count, result_name):
+    if count:
+        return f"{check_name}检查完成：已选中 {count} 个{result_name}。"
+    return f"{check_name}检查完成：未发现{result_name}。"
 
 
 def _count_findings(
@@ -128,7 +144,9 @@ def _select_findings(
         context.view_layer.objects.active = selected_meshes[0]
     if context.object.mode != 'EDIT':
         bpy.ops.object.mode_set(mode='EDIT')
-    context.tool_settings.mesh_select_mode = (True, True, True)
+    context.tool_settings.mesh_select_mode = _selection_mode_for_findings(
+        check_ngons, check_isolated,
+    )
     mesh_objects = tuple(context.objects_in_mode_unique_data)
     if not mesh_objects:
         mesh_objects = selected_meshes
@@ -275,7 +293,9 @@ class MC_OT_check_ngons(bpy.types.Operator):
         except RuntimeError as exc:
             self.report({'ERROR'}, f"无法进入网格编辑模式：{exc}")
             return {'CANCELLED'}
-        self.report({'INFO'}, f"已选中 {faces} 个多边面")
+        result_level = 'INFO' if faces else 'WARNING'
+        result_message = _check_result_message("多边面", faces, "问题面")
+        overlay.show_check_feedback(context, result_message, result_level)
         _copy_operator_to_preferences(
             self, prefs, ("ngon_sides", "ngon_clear_selection"),
         )
@@ -324,7 +344,9 @@ class MC_OT_check_isolated_vertices(bpy.types.Operator):
         except RuntimeError as exc:
             self.report({'ERROR'}, f"无法进入网格编辑模式：{exc}")
             return {'CANCELLED'}
-        self.report({'INFO'}, f"已选中 {vertices} 个孤立顶点")
+        result_level = 'INFO' if vertices else 'WARNING'
+        result_message = _check_result_message("孤立顶点", vertices, "孤立顶点")
+        overlay.show_check_feedback(context, result_message, result_level)
         _copy_operator_to_preferences(
             self, prefs, ("isolated_include_hidden", "isolated_clear_selection"),
         )
@@ -349,7 +371,7 @@ class MC_OT_toggle_uv_overlay(bpy.types.Operator):
     )
     enabled: BoolProperty(name="启用显示", default=False, options={'HIDDEN'})
     uv_stretch_base_color: FloatVectorProperty(name="无拉伸颜色", subtype='COLOR', size=3, default=(0.43, 0.78, 1.0), min=0.0, max=1.0)
-    uv_stretch_max_color: FloatVectorProperty(name="拉伸颜色", subtype='COLOR', size=3, default=(0.72, 0.34, 0.025), min=0.0, max=1.0)
+    uv_stretch_max_color: FloatVectorProperty(name="拉伸颜色", subtype='COLOR', size=3, default=(1.0, 0.0, 0.0), min=0.0, max=1.0)
     uv_stretch_strength: FloatProperty(name="拉伸显示强度", default=2.0, min=0.25, max=8.0)
     uv_stretch_threshold: FloatProperty(name="可接受拉伸阈值", default=0.0, min=0.0, max=0.999, subtype='PERCENTAGE')
     uv_stretch_opacity: FloatProperty(name="热力图透明度", default=0.85, min=0.0, max=1.0)

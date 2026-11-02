@@ -214,7 +214,7 @@ def _choose_next_edge(curr_vert: bmesh.types.BMVert,
 class MESH_OT_SmartLoopSelect(Operator):
     bl_idname = "mesh.smart_loop_select"
     bl_label = "智能环选"
-    bl_description = "智能环选：沿最直方向延伸；勾选「追踪特征折线」时优先沿锐边/台阶折角连贯选择"
+    bl_description = "仅在边选择模式下启用；沿最直方向延伸，可选追踪锐边/台阶折角"
     bl_options = {'REGISTER', 'UNDO'}
 
     max_angle: FloatProperty(
@@ -234,9 +234,17 @@ class MESH_OT_SmartLoopSelect(Operator):
 
     @classmethod
     def poll(cls, context):
-        return (context.mode == 'EDIT_MESH' and 
-                context.active_object and 
-                context.active_object.type == 'MESH')
+        tool_settings = getattr(context, 'tool_settings', None)
+        mesh_select_mode = tuple(
+            getattr(tool_settings, 'mesh_select_mode', ())
+        )
+        active_object = getattr(context, 'active_object', None)
+        return (
+            getattr(context, 'mode', None) == 'EDIT_MESH'
+            and active_object is not None
+            and getattr(active_object, 'type', None) == 'MESH'
+            and mesh_select_mode == (False, True, False)
+        )
 
     def invoke(self, context, event):
         cfg = load_smart_loop_config()
@@ -259,6 +267,13 @@ class MESH_OT_SmartLoopSelect(Operator):
         layout.prop(self, "follow_feature_creases")
 
     def execute(self, context):
+        if not MESH_OT_SmartLoopSelect.poll(context):
+            self.report(
+                {'WARNING'},
+                "智能环选仅在网格编辑模式的边选择模式下可用",
+            )
+            return {'CANCELLED'}
+
         cfg = {
             "max_angle": math.degrees(self.max_angle),
             "follow_feature_creases": self.follow_feature_creases,
@@ -270,8 +285,6 @@ class MESH_OT_SmartLoopSelect(Operator):
         bm = bmesh.from_edit_mesh(mesh)
         bm.verts.ensure_lookup_table()
         bm.edges.ensure_lookup_table()
-
-        context.tool_settings.mesh_select_mode = (False, True, False)
 
         initial_selected_edges = [e for e in bm.edges if e.select]
         if not initial_selected_edges:
