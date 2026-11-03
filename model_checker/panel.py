@@ -13,6 +13,9 @@ class VIEW3D_PT_ModelChecker(bpy.types.Panel):
 
     def draw(self, context):
         state = context.scene.model_checker_state
+        addon = context.preferences.addons.get(__package__.split('.')[0])
+        if addon is not None:
+            self.layout.row(align=True).prop(addon.preferences, 'uv_display_mode', expand=True)
         grid = self.layout.grid_flow(columns=3, even_columns=True, even_rows=True, align=True)
         features = (
             ("多边面", "mesh.model_checker_check_ngons", None, 'NGONS'),
@@ -36,3 +39,8 @@ class VIEW3D_PT_ModelChecker(bpy.types.Panel):
                 toggle.feature = feature
             settings = row.operator("wm.model_checker_settings", text="", icon='PREFERENCES')
             settings.target = settings_target
+
+        row = self.layout.row()
+        row.operator_context = 'INVOKE_DEFAULT'
+        row.operator('mesh.model_checker_uv_checks', text='UV 综合检查', icon='CHECKMARK',
+                     depress=any((state.uv_show_stretch,state.uv_show_orientation,state.uv_show_checker)))

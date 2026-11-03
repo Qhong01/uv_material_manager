@@ -18,7 +18,7 @@ import bpy
 from bpy.props import BoolProperty, CollectionProperty, EnumProperty, FloatProperty, FloatVectorProperty, IntProperty, PointerProperty, StringProperty
 from bpy.app.handlers import persistent
 
-from . import diagnostic, overlay, operators, panel
+from . import diagnostic, native_preview, overlay, operators, panel
 
 # Blender can keep a child module imported from an older add-on version after
 # the package itself is reloaded. Refresh operators only when its current API
@@ -27,6 +27,7 @@ _REQUIRED_OPERATOR_CLASSES = (
     "MC_OT_check_ngons",
     "MC_OT_check_isolated_vertices",
     "MC_OT_toggle_uv_overlay",
+    "MC_OT_uv_checks",
     "MC_OT_settings_popup",
 )
 if any(not hasattr(operators, name) for name in _REQUIRED_OPERATOR_CLASSES):
@@ -94,7 +95,8 @@ def _sync_all_scenes(prefs):
 
 
 def _enforce_uv_display_exclusivity(prefs):
-    if prefs.uv_mode_normalizing or not prefs.uv_show_checker:
+    if (prefs.uv_mode_normalizing or not prefs.uv_show_checker
+            or prefs.uv_display_mode == 'MATERIAL'):
         return
     prefs.uv_mode_normalizing = True
     try:
@@ -104,9 +106,58 @@ def _enforce_uv_display_exclusivity(prefs):
         prefs.uv_mode_normalizing = False
 
 
+def _update_uv_feature(self, context, feature):
+    if self.uv_mode_normalizing:
+        return
+    if self.uv_display_mode == 'CLASSIC' and getattr(self, feature):
+        self.uv_mode_normalizing = True
+        try:
+            if feature == 'uv_show_checker':
+                self.uv_show_stretch = self.uv_show_orientation = False
+            else:
+                self.uv_show_checker = False
+        finally:
+            self.uv_mode_normalizing = False
+    _update_scene_overlay(self, context)
+
+
+def _update_uv_stretch(self, context):
+    _update_uv_feature(self, context, 'uv_show_stretch')
+
+
+def _update_uv_orientation(self, context):
+    _update_uv_feature(self, context, 'uv_show_orientation')
+
+
+def _update_uv_checker(self, context):
+    _update_uv_feature(self, context, 'uv_show_checker')
+
+
+def _update_uv_display_mode(self, context):
+    if self.uv_mode_normalizing:
+        return
+    if self.uv_display_mode == 'CLASSIC' and (self.uv_show_stretch or self.uv_show_orientation):
+        self.uv_mode_normalizing = True
+        try:
+            self.uv_show_checker = False
+        finally:
+            self.uv_mode_normalizing = False
+    _update_scene_overlay(self, context)
+
+
 def _update_scene_overlay(self, context):
     if self.uv_mode_normalizing:
         return
+    if self.uv_display_mode == 'MATERIAL' and not self.uv_material_colors_initialized:
+        self.uv_mode_normalizing = True
+        try:
+            self.uv_material_base_color = (*self.uv_stretch_base_color, self.uv_stretch_opacity)
+            self.uv_material_max_color = (*self.uv_stretch_max_color, self.uv_stretch_opacity)
+            self.uv_material_front_color = (*self.uv_orientation_front_color, self.uv_orientation_opacity)
+            self.uv_material_back_color = (*self.uv_orientation_back_color, self.uv_orientation_opacity)
+            self.uv_material_colors_initialized = True
+        finally:
+            self.uv_mode_normalizing = False
     _enforce_uv_display_exclusivity(self)
     _sync_all_scenes(self)
     show_diagnostics = any((
@@ -115,7 +166,8 @@ def _update_scene_overlay(self, context):
         self.uv_show_orientation,
     ))
     color_type = 'VERTEX' if self.uv_show_stretch or self.uv_show_orientation else 'TEXTURE'
-    diagnostic.set_viewport_mode(context, show_diagnostics, color_type)
+    diagnostic.set_viewport_mode(context, show_diagnostics, color_type,
+                                 'MATERIAL' if self.uv_display_mode == 'MATERIAL' else 'SOLID')
     if not bpy.app.timers.is_registered(_redraw_viewports):
         bpy.app.timers.register(_redraw_viewports, first_interval=0.1)
     diagnostic.start_refresh_timer()
@@ -245,6 +297,19 @@ def _restore_overlay_settings(_dummy):
 def _disable_checker_before_lifecycle_change(_dummy):
     """Turn off the temporary checker before save, render, or file replacement."""
     addon = bpy.context.preferences.addons.get(ADDON_ID)
+    native_preview.suspend_for_save()
+    for scene in bpy.data.scenes:
+        if hasattr(scene, 'model_checker_state'):
+            scene.model_checker_state.uv_native_materials.clear()
+    if addon is not None and addon.preferences.uv_display_mode == 'MATERIAL':
+        for scene in bpy.data.scenes:
+            if hasattr(scene, 'model_checker_state'):
+                state = scene.model_checker_state
+                state.native_resume = True
+                state.uv_native_materials.clear()
+                diagnostic.sync_viewport_mode(scene, True, state.preview_shading_color_type,
+                                              state.preview_shading_type)
+        return
     checker_was_enabled = addon is not None and addon.preferences.uv_show_checker
     if checker_was_enabled:
         addon.preferences.uv_show_checker = False
@@ -263,10 +328,80 @@ def _disable_checker_before_lifecycle_change(_dummy):
         diagnostic.sync_viewport_mode(scene, remaining, 'VERTEX')
 
 
+@persistent
+def _resume_native_preview(_dummy):
+    addon = bpy.context.preferences.addons.get(ADDON_ID)
+    if addon is None or addon.preferences.uv_display_mode != 'MATERIAL':
+        return
+    for scene in bpy.data.scenes:
+        if not hasattr(scene, 'model_checker_state'):
+            continue
+        state = scene.model_checker_state
+        if state.native_resume:
+            state.native_resume = False
+            enabled = any((addon.preferences.uv_show_stretch,
+                           addon.preferences.uv_show_orientation,
+                           addon.preferences.uv_show_checker))
+            diagnostic.sync_viewport_mode(scene, enabled, 'MATERIAL', 'MATERIAL')
+            diagnostic.mark_full_refresh(state)
+    diagnostic.start_refresh_timer()
+
+
+@persistent
+def _suspend_native_before_undo(_dummy):
+    """Release evaluated preview links before Blender replaces its Main IDs."""
+    states = [scene.model_checker_state for scene in bpy.data.scenes
+              if hasattr(scene, 'model_checker_state')]
+    addon = bpy.context.preferences.addons.get(ADDON_ID)
+    active = addon is not None and addon.preferences.uv_display_mode == 'MATERIAL' and any((
+        addon.preferences.uv_show_stretch,addon.preferences.uv_show_orientation,
+        addon.preferences.uv_show_checker))
+    if not active and not any(state.uv_native_materials or state.uv_native_scratch for state in states):
+        return
+    diagnostic.stop_refresh_timer()
+    for scene in bpy.data.scenes:
+        if hasattr(scene, 'model_checker_state'):
+            state = scene.model_checker_state
+            state.refresh_in_progress = True
+            state.uv_native_scratch = None
+            state.uv_native_materials.clear()
+    native_preview.remove_all()
+    # Flush removal before undo frees the old material/node-tree evaluations.
+    if bpy.context.view_layer is not None:
+        bpy.context.view_layer.update()
+
+
+@persistent
+def _refresh_native_after_undo(_dummy):
+    addon = bpy.context.preferences.addons.get(ADDON_ID)
+    if addon is None:
+        return
+    for scene in bpy.data.scenes:
+        if hasattr(scene, 'model_checker_state'):
+            state = scene.model_checker_state
+            state.refresh_in_progress = False
+            _sync_scene_overlay(scene,addon.preferences)
+            for item in state.uv_mesh_states:
+                item.native_signature = ''
+                item.native_force_refresh = True
+            diagnostic.mark_full_refresh(state)
+    diagnostic.start_refresh_timer()
+
+
+class MC_PG_native_material(bpy.types.PropertyGroup):
+    source: PointerProperty(type=bpy.types.Material, options={'SKIP_SAVE'})
+    material: PointerProperty(type=bpy.types.Material, options={'SKIP_SAVE'})
+    signature: StringProperty(options={'SKIP_SAVE'})
+    key: StringProperty(options={'SKIP_SAVE'})
+
+
 class MC_PG_mesh_state(bpy.types.PropertyGroup):
     """Cached source signature and invalidation state for one mesh."""
 
     mesh: PointerProperty(type=bpy.types.Mesh, options={'SKIP_SAVE'})
+    native_signature: StringProperty(options={'SKIP_SAVE'})
+    native_source_signature: StringProperty(options={'SKIP_SAVE'})
+    native_force_refresh: BoolProperty(default=False, options={'SKIP_SAVE'})
     source_signature: StringProperty(default="", options={'SKIP_SAVE'})
     dirty: BoolProperty(default=False, options={'SKIP_SAVE'})
     transform_only: BoolProperty(default=False, options={'SKIP_SAVE'})
@@ -291,6 +426,9 @@ class MC_PG_scene_state(bpy.types.PropertyGroup):
     uv_display_full_refresh: BoolProperty(default=True, options={'SKIP_SAVE'})
     uv_display_refresh_cursor: IntProperty(default=0, options={'SKIP_SAVE'})
     uv_display_defer_until: FloatProperty(default=0.0, options={'SKIP_SAVE'})
+    uv_native_materials: CollectionProperty(type=MC_PG_native_material, options={'SKIP_SAVE'})
+    uv_native_scratch: PointerProperty(type=bpy.types.Mesh, options={'SKIP_SAVE'})
+    native_resume: BoolProperty(default=False, options={'SKIP_SAVE'})
     uv_mesh_states: CollectionProperty(type=MC_PG_mesh_state, options={'SKIP_SAVE'})
     refresh_in_progress: BoolProperty(default=False, options={'SKIP_SAVE'})
     uv_show_stretch: BoolProperty(default=False, options={'SKIP_SAVE'})
@@ -342,10 +480,20 @@ class MC_PG_scene_state(bpy.types.PropertyGroup):
 class MC_AddonPreferences(bpy.types.AddonPreferences):
     bl_idname = ADDON_ID
 
+    uv_display_mode: EnumProperty(name="显示方式", items=(
+        ('CLASSIC', "实体", "使用原来的实体视图显示"),
+        ('MATERIAL', "材质", "使用有光照的检查材质；颜色内 Alpha 为零时显示原材质")),
+        default='MATERIAL', update=_update_uv_display_mode)
+    uv_display_mode_version: IntProperty(default=0, options={'HIDDEN'})
+    uv_material_colors_initialized: BoolProperty(default=False, options={'HIDDEN'})
+    uv_material_base_color: FloatVectorProperty(name="无拉伸颜色", size=4, subtype='COLOR', default=(.43,.78,1,.85), min=0, max=1, update=_update_scene_overlay)
+    uv_material_max_color: FloatVectorProperty(name="最大拉伸颜色", size=4, subtype='COLOR', default=(1,0,0,.85), min=0, max=1, update=_update_scene_overlay)
+    uv_material_front_color: FloatVectorProperty(name="正向颜色", size=4, subtype='COLOR', default=(.43,.78,1,.9), min=0, max=1, update=_update_scene_overlay)
+    uv_material_back_color: FloatVectorProperty(name="反向颜色", size=4, subtype='COLOR', default=(.94,.045,.055,.9), min=0, max=1, update=_update_scene_overlay)
     uv_mode_normalizing: BoolProperty(default=False, options={'HIDDEN', 'SKIP_SAVE'})
     ngon_clear_selection: BoolProperty(name="运行前清除其他选择", default=True)
     ngon_sides: IntProperty(name="边数大于", description="顶点数超过此值的面会被选中", default=4, min=3, max=100)
-    uv_show_stretch: BoolProperty(name="显示 UV 拉伸", default=False, update=_update_scene_overlay)
+    uv_show_stretch: BoolProperty(name="显示 UV 拉伸", default=False, update=_update_uv_stretch)
     uv_stretch_opacity: FloatProperty(name="热力图透明度", default=0.85, min=0.0, max=1.0, update=_update_scene_overlay)
     uv_stretch_base_color: FloatVectorProperty(name="无拉伸颜色", subtype='COLOR', size=3, default=(0.43, 0.78, 1.0), min=0.0, max=1.0, update=_update_scene_overlay)
     uv_stretch_max_color: FloatVectorProperty(name="拉伸颜色", subtype='COLOR', size=3, default=(1.0, 0.0, 0.0), min=0.0, max=1.0, update=_update_scene_overlay)
@@ -354,12 +502,12 @@ class MC_AddonPreferences(bpy.types.AddonPreferences):
     uv_show_boundaries: BoolProperty(name="显示 UV 分界边", default=False, update=_update_scene_overlay)
     uv_boundary_color: FloatVectorProperty(name="边界颜色", subtype='COLOR', size=3, default=(1.0, 0.55, 0.08), min=0.0, max=1.0, update=_update_scene_overlay)
     uv_boundary_width: FloatProperty(name="分界线粗细", default=4.0, min=1.0, max=12.0, update=_update_boundary_width)
-    uv_show_checker: BoolProperty(name="显示棋盘格", default=False, update=_update_scene_overlay)
+    uv_show_checker: BoolProperty(name="显示棋盘格", default=False, update=_update_uv_checker)
     uv_checker_opacity: FloatProperty(name="棋盘格透明度", default=0.75, min=0.0, max=1.0, update=_update_checker_settings)
     uv_checker_density: IntProperty(name="棋盘格密度", default=8, min=1, max=256, update=_update_checker_settings)
     uv_checker_color_a: FloatVectorProperty(name="棋盘格颜色 A", subtype='COLOR', size=3, default=(0.95, 0.95, 0.95), min=0.0, max=1.0, update=_update_checker_settings)
     uv_checker_color_b: FloatVectorProperty(name="棋盘格颜色 B", subtype='COLOR', size=3, default=(0.12, 0.12, 0.12), min=0.0, max=1.0, update=_update_checker_settings)
-    uv_show_orientation: BoolProperty(name="显示 UV 正反", default=False, update=_update_scene_overlay)
+    uv_show_orientation: BoolProperty(name="显示 UV 正反", default=False, update=_update_uv_orientation)
     uv_orientation_opacity: FloatProperty(name="UV 正反透明度", default=0.9, min=0.0, max=1.0, update=_update_scene_overlay)
     uv_orientation_front_color: FloatVectorProperty(name="正向颜色", subtype='COLOR', size=3, default=(0.43, 0.78, 1.0), min=0.0, max=1.0, update=_update_scene_overlay)
     uv_orientation_back_color: FloatVectorProperty(name="反向颜色", subtype='COLOR', size=3, default=(0.94, 0.045, 0.055), min=0.0, max=1.0, update=_update_scene_overlay)
@@ -397,11 +545,13 @@ class MC_AddonPreferences(bpy.types.AddonPreferences):
 
 
 CLASSES = (
+    MC_PG_native_material,
     MC_PG_mesh_state,
     MC_PG_scene_state,
     operators.MC_OT_check_ngons,
     operators.MC_OT_check_isolated_vertices,
     operators.MC_OT_toggle_uv_overlay,
+    operators.MC_OT_uv_checks,
     operators.MC_OT_settings_popup,
     panel.VIEW3D_PT_ModelChecker,
 )
@@ -490,6 +640,10 @@ def _initialize_after_register():
     addon = bpy.context.preferences.addons.get(ADDON_ID)
     if addon is not None:
         prefs = addon.preferences
+        if prefs.uv_display_mode_version < 1:
+            prefs.uv_display_mode = 'MATERIAL'
+            prefs.uv_display_mode_version = 1
+            _schedule_preferences_save()
         needs_save = any((
             prefs.uv_show_stretch,
             prefs.uv_show_boundaries,
@@ -531,6 +685,16 @@ def register():
             handler_list.append(_disable_checker_before_lifecycle_change)
     if not bpy.app.timers.is_registered(_initialize_after_register):
         bpy.app.timers.register(_initialize_after_register, first_interval=0.1)
+    for handlers in (bpy.app.handlers.save_post, bpy.app.handlers.render_post,
+                     bpy.app.handlers.render_cancel):
+        if _resume_native_preview not in handlers:
+            handlers.append(_resume_native_preview)
+    for handlers in (bpy.app.handlers.undo_post, bpy.app.handlers.redo_post):
+        if _refresh_native_after_undo not in handlers:
+            handlers.append(_refresh_native_after_undo)
+    for handlers in (bpy.app.handlers.undo_pre, bpy.app.handlers.redo_pre):
+        if _suspend_native_before_undo not in handlers:
+            handlers.append(_suspend_native_before_undo)
     overlay.register_draw_handler()
 
 
@@ -556,6 +720,16 @@ def unregister():
     ):
         if _disable_checker_before_lifecycle_change in handler_list:
             handler_list.remove(_disable_checker_before_lifecycle_change)
+    for handlers in (bpy.app.handlers.save_post, bpy.app.handlers.render_post,
+                     bpy.app.handlers.render_cancel):
+        if _resume_native_preview in handlers:
+            handlers.remove(_resume_native_preview)
+    for handlers in (bpy.app.handlers.undo_post, bpy.app.handlers.redo_post):
+        if _refresh_native_after_undo in handlers:
+            handlers.remove(_refresh_native_after_undo)
+    for handlers in (bpy.app.handlers.undo_pre, bpy.app.handlers.redo_pre):
+        if _suspend_native_before_undo in handlers:
+            handlers.remove(_suspend_native_before_undo)
     overlay.unregister_draw_handler()
     operators.unregister_keymap()
     _remove_registered_classes()

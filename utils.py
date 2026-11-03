@@ -140,6 +140,11 @@ def reset_material_info(filepath=None, scene=None):
 
     update_material_list_handler(context.scene)
 
+def _is_uv_preview_material(material):
+    # The reserved name also covers previews recovered from pre-tag versions.
+    return bool(material.get('uvmm_native_preview', False)) or material.name.startswith('.UVMM Material Preview')
+
+
 # 更新材质列表及自动调度缩略图生成与刷新
 @persistent
 def update_material_list_handler(scene=None, depsgraph=None):
@@ -155,9 +160,14 @@ def update_material_list_handler(scene=None, depsgraph=None):
     if depsgraph:
         for update in depsgraph.updates:
             if isinstance(update.id, bpy.types.Material):
+                # Never start preview jobs on evaluated IDs or transient UV
+                # diagnostic shaders that can disappear on operator redo.
+                material = update.id.original or update.id
+                if _is_uv_preview_material(material):
+                    continue
                 try:
-                    if hasattr(update.id, 'preview_ensure'):
-                        prev = update.id.preview_ensure()
+                    if hasattr(material, 'preview_ensure'):
+                        prev = material.preview_ensure()
                         if prev:
                             prev.reload()
                 except Exception:
@@ -171,7 +181,8 @@ def update_material_list_handler(scene=None, depsgraph=None):
     for obj in scan_objs:
         for slot in obj.material_slots:
             if slot.material:
-                materials.add(slot.material)
+                if not _is_uv_preview_material(slot.material):
+                    materials.add(slot.material)
 
     new_materials = sorted(materials, key=lambda x: x.name)
 
@@ -204,6 +215,8 @@ def get_scene_materials_items(self, context):
     items = []
     if context:
         for i, mat in enumerate(bpy.data.materials):
+            if _is_uv_preview_material(mat):
+                continue
             prev = mat.preview_ensure() if hasattr(mat, 'preview_ensure') else mat.preview
             icon_id = prev.icon_id if prev else 0
             items.append((mat.name, mat.name, f"选择材质: {mat.name}", icon_id, i))

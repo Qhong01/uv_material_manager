@@ -570,13 +570,13 @@ def _write_stats_cache(
     mesh[_STATS_FLAGS_KEY] = int(valid_flags)
 
 
-def _update_object_mesh_colors(obj, uv_layer, display_attr, prefs, stats_dirty=False):
+def _object_face_stats(obj, uv_layer, prefs, stats_dirty=False):
     mesh = obj.data
     matrix = np.asarray(obj.matrix_world, dtype=np.float64)
     matrix_values = tuple(value for row in obj.matrix_world for value in row)
     polygon_count = len(mesh.polygons)
     if polygon_count == 0:
-        return True
+        return np.zeros(0), np.zeros(0, dtype=bool)
 
     need_stretch = bool(prefs.uv_show_stretch)
     need_orientation = bool(prefs.uv_show_orientation)
@@ -593,13 +593,13 @@ def _update_object_mesh_colors(obj, uv_layer, display_attr, prefs, stats_dirty=F
         mesh.calc_loop_triangles()
         triangle_count = len(mesh.loop_triangles)
         if triangle_count == 0:
-            return True
+            return np.zeros(polygon_count), np.zeros(polygon_count, dtype=bool)
 
         if len(uv_layer.data) != len(mesh.loops):
             # A scene switch / save / undo can expose an edit mesh whose UV
             # layer is momentarily detached; skip this refresh instead of
             # raising from the timer callback.
-            return True
+            return np.zeros(polygon_count), np.zeros(polygon_count, dtype=bool)
         uv_values = np.empty(len(mesh.loops) * 2, dtype=np.float32)
         uv_layer.data.foreach_get("uv", uv_values)
         loop_uvs = uv_values.reshape(-1, 2).astype(np.float64)
@@ -663,6 +663,15 @@ def _update_object_mesh_colors(obj, uv_layer, display_attr, prefs, stats_dirty=F
             mesh, max_stretch, face_flipped, uv_layer.name, matrix_values, valid_flags,
         )
 
+    return max_stretch, face_flipped
+
+
+def _update_object_mesh_colors(obj, uv_layer, display_attr, prefs, stats_dirty=False):
+    mesh = obj.data
+    polygon_count = len(mesh.polygons)
+    if polygon_count == 0:
+        return True
+    max_stretch, face_flipped = _object_face_stats(obj, uv_layer, prefs, stats_dirty)
     face_colors = _face_base_colors_array(max_stretch, face_flipped, prefs)
 
     loop_totals = np.empty(polygon_count, dtype=np.int32)
@@ -1146,7 +1155,16 @@ def transform_requires_stretch_refresh(mesh, matrix_values, show_stretch):
 
 
 def _ensure_preview(obj, prefs, force_update=False):
+    from . import native_preview
     mesh = obj.data
+    active_uv = mesh.uv_layers.active
+    native_enabled = getattr(prefs, 'uv_display_mode', 'CLASSIC') == 'MATERIAL'
+    if active_uv is not None and native_enabled:
+        _remove_legacy_preview(obj)
+        if mesh_has_diagnostic(mesh):
+            _remove_diagnostic_attributes(mesh)
+        return native_preview.ensure_preview(obj, prefs, force_update)
+    native_preview.remove_preview(obj)
     active_uv = mesh.uv_layers.active
     if active_uv is None:
         _remove_legacy_preview(obj)
@@ -1239,6 +1257,13 @@ def _checker_watchdog():
     state = scene.model_checker_state
     if state.refresh_in_progress or state.uv_display_full_refresh:
         return _CHECKER_WATCH_INTERVAL
+    if getattr(addon.preferences, 'uv_display_mode', 'CLASSIC') == 'MATERIAL':
+        from . import native_preview
+        if any(native_preview.modifier_for(obj) is None
+               for obj in visible_meshes(scene, context.view_layer) if obj.data.uv_layers.active):
+            mark_full_refresh(state)
+            start_refresh_timer()
+        return _CHECKER_WATCH_INTERVAL
     group = bpy.data.node_groups.get(_SHARED_CHECKER_GROUP)
     if group is None:
         mark_full_refresh(state)
@@ -1254,6 +1279,7 @@ def _checker_watchdog():
 
 
 def refresh_timer():
+    from . import native_preview
     context = bpy.context
     scene = context.scene
     if scene is None or not hasattr(scene, "model_checker_state"):
@@ -1307,7 +1333,7 @@ def refresh_timer():
             visible_objects = set(visible_meshes(scene, context.view_layer)) if active else set()
             visible_mesh_data = {obj.data for obj in visible_objects}
             cursor = max(0, min(int(state.uv_display_refresh_cursor), len(scene_objects)))
-            if cursor == 0:
+            if cursor == 0 and getattr(prefs, 'uv_display_mode', 'CLASSIC') != 'MATERIAL':
                 state.uv_mesh_states.clear()
             deadline = time.perf_counter() + _REFRESH_BUDGET_SECONDS
             for index in range(cursor, len(scene_objects)):
@@ -1317,7 +1343,9 @@ def refresh_timer():
                     continue
                 if obj in visible_objects:
                     _ensure_preview(obj, prefs, force_update=False)
-                elif mesh_has_diagnostic(obj.data) or _legacy_preview_modifier(obj) is not None:
+                elif (mesh_has_diagnostic(obj.data) or _legacy_preview_modifier(obj) is not None
+                      or native_preview.modifier_for(obj) is not None):
+                    native_preview.remove_preview(obj)
                     _remove_legacy_preview(obj)
                     if obj.data not in visible_mesh_data:
                         _remove_diagnostic_attributes(obj.data)
@@ -1540,6 +1568,11 @@ def restore_viewport_mode(scene, preferred_area=None):
 
 
 def cleanup_all():
+    from . import native_preview
+    native_preview.suspend_for_save()
+    for scene in bpy.data.scenes:
+        if hasattr(scene, 'model_checker_state'):
+            scene.model_checker_state.uv_native_materials.clear()
     stop_refresh_timer()
     for obj in tuple(bpy.data.objects):
         if obj.type != 'MESH':

@@ -354,11 +354,71 @@ class MC_OT_check_isolated_vertices(bpy.types.Operator):
         return {'FINISHED'}
 
 
+def _update_operator_feature(self, feature):
+    if self.uv_controls_initializing or self.uv_display_mode != 'CLASSIC' or not getattr(self, feature):
+        return
+    self.uv_controls_initializing = True
+    try:
+        if feature == 'uv_show_checker':
+            self.uv_show_stretch = self.uv_show_orientation = False
+        else:
+            self.uv_show_checker = False
+    finally:
+        self.uv_controls_initializing = False
+
+
+def _operator_stretch(self, context):
+    _update_operator_feature(self, 'uv_show_stretch')
+
+
+def _operator_orientation(self, context):
+    _update_operator_feature(self, 'uv_show_orientation')
+
+
+def _operator_checker(self, context):
+    _update_operator_feature(self, 'uv_show_checker')
+
+
+def _operator_display_mode(self, context):
+    if self.uv_controls_initializing:
+        return
+    if self.uv_display_mode == 'CLASSIC' and (self.uv_show_stretch or self.uv_show_orientation):
+        self.uv_show_checker = False
+
+
+def _capture_uv_display(operator, prefs):
+    operator.uv_controls_initializing = True
+    try:
+        for name in ('uv_display_mode','uv_show_stretch','uv_show_orientation','uv_show_checker'):
+            setattr(operator,name,getattr(prefs,name))
+    finally:
+        operator.uv_controls_initializing = False
+
+
+def _apply_uv_display(operator, prefs, context):
+    prefs.uv_mode_normalizing = True
+    try:
+        for name in ('uv_display_mode','uv_show_stretch','uv_show_orientation','uv_show_checker'):
+            setattr(prefs,name,getattr(operator,name))
+    finally:
+        prefs.uv_mode_normalizing = False
+    from . import _update_scene_overlay
+    _update_scene_overlay(prefs, context)
+    from . import native_preview
+    native_preview.prepare_display(context,prefs)
+
+
 class MC_OT_toggle_uv_overlay(bpy.types.Operator):
     bl_idname = "mesh.model_checker_toggle_uv"
     bl_label = "切换 UV 显示"
     bl_description = "独立开启或关闭场景中可见模型的 UV 显示"
     bl_options = {'REGISTER', 'UNDO'}
+    uv_controls_initializing: BoolProperty(default=False, options={'HIDDEN', 'SKIP_SAVE'})
+    uv_display_mode: EnumProperty(name='显示方式', items=(
+        ('CLASSIC','实体',''),('MATERIAL','材质','')), default='MATERIAL', update=_operator_display_mode)
+    uv_show_stretch: BoolProperty(name='拉伸', default=False, update=_operator_stretch)
+    uv_show_orientation: BoolProperty(name='正反', default=False, update=_operator_orientation)
+    uv_show_checker: BoolProperty(name='棋盘格', default=False, update=_operator_checker)
 
     feature: EnumProperty(
         name="UV 显示项",
@@ -409,11 +469,20 @@ class MC_OT_toggle_uv_overlay(bpy.types.Operator):
         if prefs is None:
             return {'CANCELLED'}
         self.enabled = not bool(getattr(prefs, self.feature))
+        _capture_uv_display(self, prefs)
+        if self.feature != 'uv_show_boundaries':
+            setattr(self, self.feature, self.enabled)
         _copy_preferences_to_operator(self, prefs, _UV_FEATURE_SETTINGS[self.feature])
         return self.execute(context)
 
     def draw(self, context):
         layout = self.layout
+        prefs = _read_preferences(context)
+        if prefs is not None and self.feature != 'uv_show_boundaries':
+            _draw_uv_display_controls(layout, self)
+        if prefs is not None and prefs.uv_display_mode == 'MATERIAL' and self.feature in {'uv_show_stretch', 'uv_show_orientation'}:
+            _draw_native_colors(layout, prefs, self.feature == 'uv_show_stretch')
+            return
         if self.feature == 'uv_show_stretch':
             layout.label(text="UV 拉伸")
             layout.prop(self, "uv_stretch_base_color")
@@ -456,19 +525,18 @@ class MC_OT_toggle_uv_overlay(bpy.types.Operator):
         if prefs is None:
             self.report({'ERROR'}, "模型检查插件设置不可用")
             return {'CANCELLED'}
-        if self.enabled and self.feature in {'uv_show_stretch', 'uv_show_orientation'}:
+        if self.feature != 'uv_show_boundaries' and not self.properties.is_property_set('uv_display_mode'):
+            _capture_uv_display(self, prefs)
+            setattr(self, self.feature, self.enabled)
+        if self.feature in {'uv_show_stretch','uv_show_orientation'} and getattr(self,self.feature):
             _ensure_object_mode(context)
         setting_names = _UV_FEATURE_SETTINGS[self.feature]
         _copy_operator_to_preferences(self, prefs, setting_names)
         previous_value = getattr(prefs, self.feature)
-        next_value = self.enabled
-        if next_value and self.feature == 'uv_show_checker':
-            prefs.uv_show_stretch = False
-            prefs.uv_show_orientation = False
-        elif next_value and self.feature in {'uv_show_stretch', 'uv_show_orientation'}:
-            prefs.uv_show_checker = False
-        if previous_value != next_value:
-            setattr(prefs, self.feature, next_value)
+        if self.feature == 'uv_show_boundaries':
+            setattr(prefs,self.feature,self.enabled)
+        else:
+            _apply_uv_display(self,prefs,context)
         visible_meshes = _visible_meshes(context)
         if getattr(prefs, self.feature) and not any(obj.data.uv_layers.active for obj in visible_meshes):
             self.report({'WARNING'}, "场景中可见的模型没有 UV 层")
@@ -488,6 +556,57 @@ class MC_OT_toggle_uv_overlay(bpy.types.Operator):
                 state.refresh_in_progress = False
             self.report({'INFO'}, f"已在物体模式下选中 {found_objects} 个含 UV 问题的物体")
         _tag_viewports(context)
+        return {'FINISHED'}
+
+
+class MC_OT_uv_checks(bpy.types.Operator):
+    bl_idname = "mesh.model_checker_uv_checks"
+    bl_label = "UV 综合检查"
+    bl_description = "点击开启检查，再次点击全部关闭；左下角可分别勾选显示项"
+    bl_options = {'REGISTER', 'UNDO'}
+    uv_controls_initializing: BoolProperty(default=False, options={'HIDDEN', 'SKIP_SAVE'})
+    uv_display_mode: EnumProperty(name='显示方式', items=(
+        ('CLASSIC','实体',''),('MATERIAL','材质','')), default='MATERIAL', update=_operator_display_mode)
+    uv_show_stretch: BoolProperty(name='拉伸', default=False, update=_operator_stretch)
+    uv_show_orientation: BoolProperty(name='正反', default=False, update=_operator_orientation)
+    uv_show_checker: BoolProperty(name='棋盘格', default=False, update=_operator_checker)
+    enabled: BoolProperty(default=True, options={'HIDDEN'})
+
+    @classmethod
+    def poll(cls, context):
+        return MC_OT_toggle_uv_overlay.poll(context)
+
+    def invoke(self, context, event):
+        prefs = _read_preferences(context)
+        if prefs is None:
+            return {'CANCELLED'}
+        self.enabled = not any((prefs.uv_show_stretch,prefs.uv_show_orientation,prefs.uv_show_checker))
+        self._prepare(prefs)
+        return self.execute(context)
+
+    def _prepare(self, prefs):
+        self.uv_controls_initializing = True
+        try:
+            self.uv_display_mode = 'MATERIAL' if self.enabled else prefs.uv_display_mode
+            self.uv_show_stretch = self.uv_show_orientation = self.uv_show_checker = self.enabled
+        finally:
+            self.uv_controls_initializing = False
+
+    def draw(self, context):
+        _draw_uv_display_controls(self.layout, self)
+
+    def execute(self, context):
+        prefs = _read_preferences(context)
+        if prefs is None:
+            return {'CANCELLED'}
+        if not self.properties.is_property_set('uv_display_mode'):
+            if not self.properties.is_property_set('enabled'):
+                self.enabled = not any((prefs.uv_show_stretch,prefs.uv_show_orientation,prefs.uv_show_checker))
+            self._prepare(prefs)
+        _apply_uv_display(self,prefs,context)
+        _tag_viewports(context)
+        active = any((prefs.uv_show_stretch,prefs.uv_show_orientation,prefs.uv_show_checker))
+        self.report({'INFO'}, "UV 综合检查已开启，可在左下角选择显示项" if active else "UV 综合检查已关闭")
         return {'FINISHED'}
 
 
@@ -517,6 +636,11 @@ class MC_OT_settings_popup(bpy.types.Operator):
             self.layout.label(text="模型检查插件设置不可用", icon='ERROR')
             return
         layout = self.layout
+        if self.target in {'UV_STRETCH', 'UV_ORIENTATION', 'UV_CHECKER'}:
+            _draw_uv_display_controls(layout, prefs)
+        if prefs.uv_display_mode == 'MATERIAL' and self.target in {'UV_STRETCH', 'UV_ORIENTATION'}:
+            _draw_native_colors(layout, prefs, self.target == 'UV_STRETCH')
+            return
         if self.target == 'NGONS':
             layout.label(text="多边面检查")
             row = layout.row()
@@ -575,3 +699,27 @@ def unregister_keymap():
     for item in tuple(keymap.keymap_items):
         if item.idname == "mesh.model_checker_run":
             keymap.keymap_items.remove(item)
+
+
+def _draw_native_colors(layout, prefs, stretch):
+    if stretch:
+        layout.prop(prefs, 'uv_material_base_color')
+        layout.prop(prefs, 'uv_material_max_color')
+        layout.prop(prefs, 'uv_stretch_strength', slider=True)
+        layout.prop(prefs, 'uv_stretch_threshold', slider=True)
+    else:
+        layout.prop(prefs, 'uv_material_front_color')
+        layout.prop(prefs, 'uv_material_back_color')
+    layout.label(text='Alpha 0：显示下层棋盘格或原材质', icon='INFO')
+    layout.label(text='原材质按材质预览的光照显示')
+
+
+def _draw_uv_display_controls(layout, prefs):
+    layout.row(align=True).prop(prefs, 'uv_display_mode', expand=True)
+    row = layout.row(align=True)
+    row.prop(prefs, 'uv_show_stretch', text='拉伸')
+    row.prop(prefs, 'uv_show_orientation', text='正反')
+    row.prop(prefs, 'uv_show_checker', text='棋盘格')
+    if prefs.uv_display_mode == 'CLASSIC':
+        layout.label(text='实体模式：棋盘格与拉伸、正反互斥', icon='INFO')
+

@@ -289,12 +289,16 @@ def _invalidate_overlay_cache(scene, depsgraph):
         return
 
     from . import diagnostic
+    addon = bpy.context.preferences.addons.get(__package__.split('.')[0])
+    native_display = addon is not None and addon.preferences.uv_display_mode == 'MATERIAL'
     needs_refresh = False
     for mesh in changed_meshes:
         needs_refresh = diagnostic.mark_mesh_dirty(
             state,
             mesh,
-            force=state.uv_show_checker,
+            # Native input comparison is deferred to its refresh timer, so
+            # depsgraph notifications during an edit remain inexpensive.
+            force=native_display or state.uv_show_checker,
             transform_only=False,
         ) or needs_refresh
     for mesh, objects in transformed_objects.items():
