@@ -4,8 +4,9 @@ import bpy
 import bmesh
 import blf
 from pathlib import Path
+from contextlib import contextmanager
 from bpy.app.handlers import persistent
-from bpy.props import CollectionProperty, IntProperty, PointerProperty, StringProperty
+from bpy.props import BoolProperty, CollectionProperty, IntProperty, PointerProperty, StringProperty
 from bpy.types import Menu, Operator, PropertyGroup
 
 
@@ -19,14 +20,22 @@ class FocusHiddenObject(PropertyGroup):
     object: PointerProperty(type=bpy.types.Object)
 
 
+class FocusModifierVisibility(PropertyGroup):
+    object: PointerProperty(type=bpy.types.Object)
+    modifier_uid: IntProperty()
+    show_viewport: BoolProperty()
+
+
 class FocusVisibilityLevel(PropertyGroup):
     view_layer_name: StringProperty()
     hide_kind: StringProperty(default='UNSELECTED')
     hidden_objects: CollectionProperty(type=FocusHiddenObject)
+    modifiers: CollectionProperty(type=FocusModifierVisibility)
 
 
 class FocusVisibilityStack(PropertyGroup):
     levels: CollectionProperty(type=FocusVisibilityLevel)
+    is_updating: BoolProperty(default=False)
 
 
 class FocusHiddenFace(PropertyGroup):
@@ -38,15 +47,75 @@ class FocusHiddenFace(PropertyGroup):
 class FocusFaceVisibilityLevel(PropertyGroup):
     hide_kind: StringProperty(default='UNSELECTED')
     hidden_faces: CollectionProperty(type=FocusHiddenFace)
+    modifiers: CollectionProperty(type=FocusModifierVisibility)
 
 
 class FocusFaceVisibilityStack(PropertyGroup):
     levels: CollectionProperty(type=FocusFaceVisibilityLevel)
+    is_updating: BoolProperty(default=False)
 
 
 def _edit_meshes(context):
     return [obj for obj in context.objects_in_mode_unique_data
             if obj.type == 'MESH']
+
+
+@contextmanager
+def _focus_modifier_changes(scene):
+    # Temporary focus visibility must not propagate through modifier sync.
+    from .modifier_manager import ModifierAutoSync
+    state = ModifierAutoSync.get_state(scene)
+    previous = state.is_syncing if state else False
+    if state:
+        state.is_syncing = True
+    try:
+        yield
+    finally:
+        if state:
+            if bpy.context.scene == scene:
+                ModifierAutoSync.ensure_snapshots(scene, bpy.context.selected_objects)
+            state.is_syncing = previous
+
+
+def _focus_modifiers_to_hide(objects, show_mirror, show_array):
+    types = set()
+    if not show_mirror:
+        types.add('MIRROR')
+    if not show_array:
+        types.add('ARRAY')
+    return [(obj, mod) for obj in objects if obj.is_editable
+            for mod in obj.modifiers if _focus_modifier_type(mod) in types and mod.show_viewport
+            and not mod.is_property_readonly('show_viewport')]
+
+
+def _focus_modifier_type(mod):
+    if mod.type == 'NODES' and mod.node_group is not None:
+        ref = mod.node_group.library_weak_reference
+        if (ref is not None and ref.id_name == 'NTArray'
+                and Path(ref.filepath).name == 'geometry_nodes_essentials.blend'):
+            return 'ARRAY'
+    return mod.type
+
+
+def _hide_focus_modifiers(scene, level, modifiers):
+    with _focus_modifier_changes(scene):
+        for obj, mod in modifiers:
+            entry = level.modifiers.add()
+            entry.object = obj
+            entry.modifier_uid = mod.persistent_uid
+            entry.show_viewport = mod.show_viewport
+            mod.show_viewport = False
+
+
+def _restore_focus_modifiers(scene, level):
+    with _focus_modifier_changes(scene):
+        for entry in level.modifiers:
+            obj = entry.object
+            if obj is None or not obj.is_editable:
+                continue
+            mod = next((mod for mod in obj.modifiers if mod.persistent_uid == entry.modifier_uid), None)
+            if mod is not None:
+                mod.show_viewport = entry.show_viewport
 
 
 def _face_key(face):
@@ -108,6 +177,7 @@ def _restore_last_face_level(scene, context):
     for entry in level.hidden_faces:
         obj = entry.object
         if obj is None or obj.as_pointer() not in edit_objects:
+            _restore_focus_modifiers(scene, level)
             return -1
         bm = bmesh.from_edit_mesh(obj.data)
         bm.verts.ensure_lookup_table()
@@ -115,9 +185,11 @@ def _restore_last_face_level(scene, context):
         bm.verts.index_update()
         bm.faces.index_update()
         if entry.face_index >= len(bm.faces):
+            _restore_focus_modifiers(scene, level)
             return -1
         face = bm.faces[entry.face_index]
         if _face_key(face) != entry.vertices:
+            _restore_focus_modifiers(scene, level)
             return -1
         faces_by_object.setdefault(obj.as_pointer(), (obj, []))[1].append(
             entry.face_index)
@@ -129,6 +201,7 @@ def _restore_last_face_level(scene, context):
         bm.normal_update()
         bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
     restored = len(level.hidden_faces)
+    _restore_focus_modifiers(scene, level)
     stack.levels.remove(len(stack.levels) - 1)
     return restored
 
@@ -171,6 +244,15 @@ class VIEW3D_OT_UVMMHideUnselected(Operator):
     bl_description = "隐藏未选物体或面；上一操作隐藏所选时逐层恢复"
     bl_options = {'REGISTER', 'UNDO'}
 
+    ignore_lights: BoolProperty(name="忽略灯光", description="独显时保留原本可见的灯光", default=True)
+    show_mirror: BoolProperty(name="显示镜像", description="保留镜像修改器的原有视口显示；取消时临时隐藏镜像结果", default=True)
+    show_array: BoolProperty(name="显示阵列", description="保留阵列修改器的原有视口显示；取消时临时隐藏阵列结果", default=True)
+
+    def draw(self, context):
+        self.layout.prop(self, 'ignore_lights')
+        self.layout.prop(self, 'show_mirror')
+        self.layout.prop(self, 'show_array')
+
     @classmethod
     def poll(cls, context):
         if (context.mode not in {'OBJECT', 'EDIT_MESH'}
@@ -212,8 +294,10 @@ class VIEW3D_OT_UVMMHideUnselected(Operator):
             obj for obj in view_layer.objects
             if obj.as_pointer() not in selected_pointers
             and obj.visible_get(view_layer=view_layer)
+            and not (self.ignore_lights and obj.type == 'LIGHT')
         ]
-        if not targets:
+        modifiers = _focus_modifiers_to_hide(context.selected_objects, self.show_mirror, self.show_array)
+        if not targets and not modifiers:
             restored_count = _restore_last_visibility_level(context.scene)
             if restored_count is not None:
                 context.area.tag_redraw()
@@ -225,9 +309,13 @@ class VIEW3D_OT_UVMMHideUnselected(Operator):
             self.report({'INFO'}, "没有可隐藏的未选中物体")
             return {'CANCELLED'}
 
+        previous_levels = len(stack.levels)
         try:
             _hide_objects_as_level(context.scene, view_layer, targets, 'UNSELECTED')
+            _hide_focus_modifiers(context.scene, stack.levels[-1], modifiers)
         except (ReferenceError, RuntimeError, TypeError) as exc:
+            if len(stack.levels) > previous_levels:
+                _restore_last_visibility_level(context.scene)
             self.report({'ERROR'}, f"隐藏未选物体失败，已回滚：{exc}")
             return {'CANCELLED'}
 
@@ -250,9 +338,11 @@ class VIEW3D_OT_UVMMHideUnselected(Operator):
             context.area.tag_redraw()
             return {'FINISHED'}
         targets = _edit_face_targets(context, False)
-        if not targets:
+        modifiers = _focus_modifiers_to_hide(context.objects_in_mode, self.show_mirror, self.show_array)
+        if not targets and not modifiers:
             return {'CANCELLED'}
         count = _hide_faces_as_level(context.scene, targets, 'UNSELECTED')
+        _hide_focus_modifiers(context.scene, stack.levels[-1], modifiers)
         context.area.tag_redraw()
         self.report({'INFO'}, f"已隐藏 {count} 个未选中面")
         return {'FINISHED'}
@@ -288,6 +378,7 @@ def _restore_last_visibility_level(scene):
     level = stack.levels[level_index]
     view_layer = scene.view_layers.get(level.view_layer_name)
     if view_layer is None:
+        _restore_focus_modifiers(scene, level)
         stack.levels.remove(level_index)
         return 0
 
@@ -298,6 +389,7 @@ def _restore_last_visibility_level(scene):
             obj.hide_set(False, view_layer=view_layer)
             restored_count += 1
 
+    _restore_focus_modifiers(scene, level)
     stack.levels.remove(level_index)
     return restored_count
 
@@ -472,10 +564,12 @@ def _tag_viewports_redraw():
 @persistent
 def _clear_focus_stack_when_all_revealed(scene, depsgraph):
     stack = getattr(scene, "uvmm_focus_visibility_stack", None)
-    if stack is None or not stack.levels:
+    if stack is None or not stack.levels or stack.is_updating:
         return
 
     for level in stack.levels:
+        if not level.hidden_objects and level.modifiers:
+            return
         view_layer = scene.view_layers.get(level.view_layer_name)
         if view_layer is None:
             continue
@@ -485,25 +579,91 @@ def _clear_focus_stack_when_all_revealed(scene, depsgraph):
                     and obj.hide_get(view_layer=view_layer)):
                 return
 
-    while stack.levels:
-        stack.levels.remove(len(stack.levels) - 1)
+    stack.is_updating = True
+    try:
+        while stack.levels:
+            _restore_focus_modifiers(scene, stack.levels[-1])
+            stack.levels.remove(len(stack.levels) - 1)
+    finally:
+        stack.is_updating = False
     _tag_viewports_redraw()
+
+
+def _face_entry_is_hidden(entry):
+    obj = entry.object
+    if obj is None or obj.type != 'MESH':
+        return False
+
+    bm = None
+    owns_bmesh = obj.mode != 'EDIT'
+    try:
+        if owns_bmesh:
+            bm = bmesh.new()
+            bm.from_mesh(obj.data)
+        else:
+            bm = bmesh.from_edit_mesh(obj.data)
+        bm.faces.ensure_lookup_table()
+        bm.verts.ensure_lookup_table()
+        bm.faces.index_update()
+        if entry.face_index < 0 or entry.face_index >= len(bm.faces):
+            return False
+        face = bm.faces[entry.face_index]
+        if _face_key(face) != entry.vertices:
+            return False
+        return face.hide
+    except (ReferenceError, RuntimeError, TypeError, ValueError):
+        return False
+    finally:
+        if owns_bmesh and bm is not None:
+            bm.free()
+
+
+def _clear_face_stack_when_all_revealed(scene):
+    face_stack = getattr(scene, 'uvmm_focus_face_stack', None)
+    if face_stack is None or not face_stack.levels or face_stack.is_updating:
+        return False
+
+    for level in face_stack.levels:
+        if not level.hidden_faces and level.modifiers:
+            return False
+        if any(_face_entry_is_hidden(entry) for entry in level.hidden_faces):
+            return False
+
+    face_stack.is_updating = True
+    try:
+        while face_stack.levels:
+            _restore_focus_modifiers(scene, face_stack.levels[-1])
+            face_stack.levels.remove(len(face_stack.levels) - 1)
+    finally:
+        face_stack.is_updating = False
+    return True
+
+
+@persistent
+def _clear_focus_face_stack_when_all_revealed(scene, depsgraph):
+    if _clear_face_stack_when_all_revealed(scene):
+        _tag_viewports_redraw()
 
 
 def _register_focus_stack_handler():
     handlers = bpy.app.handlers.depsgraph_update_post
     if _clear_focus_stack_when_all_revealed not in handlers:
         handlers.append(_clear_focus_stack_when_all_revealed)
+    if _clear_focus_face_stack_when_all_revealed not in handlers:
+        handlers.append(_clear_focus_face_stack_when_all_revealed)
 
 
 def _unregister_focus_stack_handler():
     handlers = bpy.app.handlers.depsgraph_update_post
     if _clear_focus_stack_when_all_revealed in handlers:
         handlers.remove(_clear_focus_stack_when_all_revealed)
+    if _clear_focus_face_stack_when_all_revealed in handlers:
+        handlers.remove(_clear_focus_face_stack_when_all_revealed)
 
 
 _CLASSES = (
     FocusHiddenObject,
+    FocusModifierVisibility,
     FocusVisibilityLevel,
     FocusVisibilityStack,
     FocusHiddenFace,
@@ -590,6 +750,12 @@ def unregister():
     _unregister_focus_stack_handler()
     _unregister_layer_counter_font()
     unregister_keymaps()
+    for scene in bpy.data.scenes:
+        for name in ('uvmm_focus_visibility_stack', 'uvmm_focus_face_stack'):
+            stack = getattr(scene, name, None)
+            if stack is not None:
+                for level in reversed(list(stack.levels)):
+                    _restore_focus_modifiers(scene, level)
     if hasattr(bpy.types.Scene, 'uvmm_focus_visibility_stack'):
         del bpy.types.Scene.uvmm_focus_visibility_stack
     if hasattr(bpy.types.Scene, 'uvmm_focus_face_stack'):

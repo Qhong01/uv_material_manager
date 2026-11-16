@@ -1,7 +1,7 @@
 import bpy
 import json
-from bpy.types import Operator, Menu, PropertyGroup
-from bpy.props import StringProperty, BoolProperty, PointerProperty, CollectionProperty
+from bpy.types import Operator, Menu, Panel, PropertyGroup
+from bpy.props import StringProperty, BoolProperty, IntProperty, PointerProperty, CollectionProperty
 from bpy.app.handlers import persistent
 from . import modifier_layouts
 
@@ -76,6 +76,12 @@ def get_modifier_icon(mod_type):
 class ModifierSyncSnapshot(PropertyGroup):
     object_name: StringProperty()
     modifier_name: StringProperty()
+    modifier_uid: IntProperty()
+    modifier_type: StringProperty()
+    data: StringProperty()
+
+
+class ModifierSyncChange(PropertyGroup):
     data: StringProperty()
 
 
@@ -85,6 +91,40 @@ class ModifierSyncRuntimeState(PropertyGroup):
     is_syncing: BoolProperty(default=False)
     warning_message: StringProperty()
     status_message: StringProperty()
+
+
+class ModifierSyncHistory(PropertyGroup):
+    # Session-only journal: Scene RNA is itself restored by native undo.
+    scene_name: StringProperty()
+    changes: CollectionProperty(type=ModifierSyncChange)
+    change_cursor: IntProperty(default=0)
+    undo_baseline: StringProperty()
+    undo_participants: StringProperty()
+    is_restoring: BoolProperty(default=False)
+    pending_operation: StringProperty()
+    last_operation_token: StringProperty()
+
+
+def _modifier_history(scene, create=False):
+    wm = getattr(bpy.context, 'window_manager', None)
+    if wm is None:
+        return None
+    for history in wm.um_modifier_sync_histories:
+        if history.scene_name == scene.name:
+            return history
+    if create:
+        history = wm.um_modifier_sync_histories.add()
+        history.scene_name = scene.name
+        return history
+    return None
+
+
+def _is_user_modifier(mod):
+    if mod.type != 'NODES':
+        return True
+    if mod.node_group is not None:
+        return not mod.node_group.get('uvmm_native_preview', False)
+    return not mod.name.startswith('UV 检查 · 材质预览（临时）')
 
 
 class UMM_OT_StatusTooltip(Operator):
@@ -118,7 +158,7 @@ def draw_status_tooltip(layout, message, icon='INFO', alert=False):
 class ModifierAutoSync:
     ALWAYS_IGNORED_PROPERTIES = {
         'name', 'type', 'show_expanded', 'is_active', 'execution_time',
-        'is_override_data'
+        'is_override_data', 'use_pin_to_last'
     }
     IGNORED_PROPERTIES = {
         'show_viewport', 'show_render', 'show_in_editmode', 'show_on_cage',
@@ -129,6 +169,8 @@ class ModifierAutoSync:
     def serialize_value(cls, val):
         if val is None:
             return None
+        if isinstance(val, set):
+            return sorted(val)
         if isinstance(val, (int, float, str, bool)):
             return val
         if isinstance(val, bpy.types.bpy_struct):
@@ -141,7 +183,7 @@ class ModifierAutoSync:
         return str(val)
 
     @classmethod
-    def get_snapshot(cls, mod, include_display=False):
+    def get_snapshot(cls, mod, include_display=True):
         snap = {}
         for p in mod.bl_rna.properties:
             ignored = cls.ALWAYS_IGNORED_PROPERTIES
@@ -153,6 +195,13 @@ class ModifierAutoSync:
                     snap[p.identifier] = cls.serialize_value(val)
                 except Exception:
                     pass
+        for category, sockets in _modifier_node_properties(mod).items():
+            for identifier, fields in sockets.items():
+                for name in fields:
+                    key = f'@/{category}/{identifier}/{name}'
+                    snap[key] = cls.serialize_value(_get_modifier_parameter(mod, key))
+        for key, value in _modifier_nested_parameters(mod).items():
+            snap[key] = cls.serialize_value(value)
         return snap
 
     @classmethod
@@ -165,7 +214,7 @@ class ModifierAutoSync:
         if not state:
             return None
         return next((entry for entry in state.snapshots
-                     if entry.object_name == obj.name and entry.modifier_name == mod.name), None)
+                     if entry.object_name == obj.name and entry.modifier_uid == mod.persistent_uid), None)
 
     @classmethod
     def set_snapshot(cls, scene, obj, mod, snapshot=None):
@@ -176,7 +225,9 @@ class ModifierAutoSync:
         if entry is None:
             entry = state.snapshots.add()
             entry.object_name = obj.name
-            entry.modifier_name = mod.name
+        entry.modifier_name = mod.name
+        entry.modifier_uid = mod.persistent_uid
+        entry.modifier_type = mod.type
         entry.data = json.dumps(snapshot if snapshot is not None else cls.get_snapshot(mod), sort_keys=True)
 
     @classmethod
@@ -199,7 +250,8 @@ class ModifierAutoSync:
         for obj in objects:
             if obj and obj.type == 'MESH':
                 for mod in obj.modifiers:
-                    cls.set_snapshot(scene, obj, mod)
+                    if _is_user_modifier(mod):
+                        cls.set_snapshot(scene, obj, mod)
 
     @classmethod
     def reset_all_states(cls, *_args):
@@ -214,7 +266,8 @@ class ModifierAutoSync:
     @classmethod
     def update_handler(cls, scene, depsgraph):
         state = cls.get_state(scene)
-        if not state or state.is_syncing:
+        history = _modifier_history(scene)
+        if not state or state.is_syncing or (history and history.is_restoring):
             return
 
         if hasattr(scene, "um_auto_sync_modifiers") and not scene.um_auto_sync_modifiers:
@@ -245,10 +298,9 @@ class ModifierAutoSync:
         # 只检查本次确实发生几何更新的选中物体，活动物体和非活动选中物体都可作为同步源。
         updated_geometry_ids = set()
         for update in depsgraph.updates:
-            if not update.is_updated_geometry:
-                continue
             original_id = getattr(update.id, "original", None)
-            if original_id is not None:
+            if original_id is not None and (update.is_updated_geometry
+                                             or isinstance(original_id, bpy.types.Object)):
                 updated_geometry_ids.add(original_id.as_pointer())
         updated_objects = [
             obj for obj in selected_objs
@@ -261,9 +313,23 @@ class ModifierAutoSync:
         state.is_syncing = True
         try:
             state.warning_message = ""
+            changes = []
+            added_count = 0
+            skipped_objects = set()
+            if active_obj in updated_objects:
+                changes, added_count, skipped_objects = _sync_added_modifiers(
+                    scene, active_obj, selected_objs)
+                removed_changes, removed_count, removal_skips = _sync_removed_modifiers(
+                    scene, active_obj, selected_objs, depsgraph)
+                changes.extend(removed_changes)
+                skipped_objects.update(removal_skips)
+            else:
+                removed_count = 0
             changed_values = {}
             for source_obj in updated_objects:
                 for mod in source_obj.modifiers:
+                    if not _is_user_modifier(mod):
+                        continue
                     snapshot_entry = cls.find_snapshot(scene, source_obj, mod)
                     prev_snap = json.loads(snapshot_entry.data) if snapshot_entry and snapshot_entry.data else None
                     curr_snap = cls.get_snapshot(mod)
@@ -284,31 +350,62 @@ class ModifierAutoSync:
                     for source in sources
                 }
                 if len(distinct_values) > 1:
+                    changes.extend(_parameter_change(scene, obj, mod, prop_id, value)
+                                   for obj, mod, value in sources)
                     continue
 
                 source_obj, source_mod, _serialized_value = sources[0]
-                raw_value = getattr(source_mod, prop_id)
+                raw_value = _get_modifier_parameter(source_mod, prop_id)
+                change = _parameter_change(scene, source_obj, source_mod, prop_id, _serialized_value)
                 for target_obj in selected_objs:
-                    if target_obj == source_obj:
+                    if any(target_obj == source[0] for source in sources):
                         continue
                     target_mod = target_obj.modifiers.get(modifier_name)
-                    if (target_mod and target_mod.type == modifier_type
-                            and hasattr(target_mod, prop_id)):
+                    if target_mod and target_mod.type == modifier_type:
                         try:
+                            previous_value = _modifier_history_value(_get_modifier_parameter(target_mod, prop_id))
                             if isinstance(raw_value, (tuple, list)):
-                                setattr(target_mod, prop_id, list(raw_value))
+                                _set_modifier_parameter(target_mod, prop_id, list(raw_value))
                             else:
-                                setattr(target_mod, prop_id, raw_value)
+                                _set_modifier_parameter(target_mod, prop_id, raw_value)
                             key = (modifier_name, prop_id)
                             synced_counts[key] = synced_counts.get(key, 0) + 1
-                        except Exception:
-                            pass
+                            change['targets'].append({
+                                'object': target_obj.name, 'before': previous_value,
+                                'after': _modifier_history_value(_get_modifier_parameter(target_mod, prop_id)),
+                            })
+                        except (AttributeError, TypeError, ValueError, RuntimeError):
+                            skipped_objects.add(target_obj.name)
+                    else:
+                        skipped_objects.add(target_obj.name)
+                changes.append(change)
+                changes.extend(_parameter_change(scene, obj, mod, prop_id, value)
+                               for obj, mod, value in sources[1:])
+
+            if changes:
+                history = _modifier_history(scene, create=True)
+                while len(history.changes) > history.change_cursor:
+                    history.changes.remove(len(history.changes) - 1)
+                entry = history.changes.add()
+                entry.data = json.dumps(changes)
+                limit = max(64, bpy.context.preferences.edit.undo_steps * 128)
+                while len(history.changes) > limit:
+                    history.changes.remove(0)
+                history.change_cursor = len(history.changes)
 
             # 同步之后统一刷新所选物体的基线，防止后续视图更新重复触发。
             cls.ensure_snapshots(scene, selected_objs)
             if synced_counts:
                 (modifier_name, prop_id), count = next(iter(synced_counts.items()))
-                state.status_message = f"已同步 {modifier_name} 的 {prop_id} 参数到 {count} 个物体"
+                label_mod = active_obj.modifiers.get(modifier_name)
+                label = _modifier_parameter_label(label_mod, prop_id)
+                state.status_message = f"已同步 {modifier_name} · {label}，{count} 个物体"
+            elif added_count:
+                state.status_message = f"已同步新增修改器到 {added_count} 个物体"
+            elif removed_count:
+                state.status_message = f"已同步修改器操作到 {removed_count} 个物体"
+            if skipped_objects:
+                state.warning_message = f"已跳过 {len(skipped_objects)} 个缺少匹配修改器或不可写的物体"
         finally:
             state.is_syncing = False
 
@@ -328,11 +425,706 @@ def depsgraph_update_handler(scene, depsgraph):
 @persistent
 def modifier_sync_reset_handler(*args):
     ModifierAutoSync.reset_all_states(*args)
+    scene = bpy.context.scene
+    if scene is not None:
+        update_modifier_sync_enabled(scene, bpy.context)
+
+
+@persistent
+def modifier_sync_load_post(*args):
+    bpy.context.window_manager.um_modifier_sync_histories.clear()
+    modifier_sync_reset_handler(*args)
+
+
+def _modifier_history_value(value):
+    if isinstance(value, bpy.types.ID):
+        return {'id_type': value.bl_rna.identifier, 'name': value.name_full,
+                'library': value.library.filepath if value.library else ''}
+    return ModifierAutoSync.serialize_value(value)
+
+
+def _parameter_change(scene, obj, mod, identifier, value):
+    entry = ModifierAutoSync.find_snapshot(scene, obj, mod)
+    return {'source': obj.name, 'source_uid': mod.persistent_uid,
+            'modifier': mod.name, 'type': mod.type, 'property': identifier,
+            'before': json.loads(entry.data)[identifier], 'after': value, 'targets': []}
+
+
+def _modifier_node_properties(mod):
+    node_properties = {}
+    properties = getattr(mod, 'properties', None) if mod.type == 'NODES' else None
+    if properties is not None and mod.node_group is not None:
+        for socket in mod.node_group.interface.items_tree:
+            if socket.item_type != 'SOCKET':
+                continue
+            category = 'inputs' if socket.in_out == 'INPUT' else 'outputs'
+            value = getattr(getattr(properties, category), socket.identifier, None)
+            if value is not None:
+                node_properties.setdefault(category, {})[socket.identifier] = {
+                    name: _modifier_history_value(getattr(value, name))
+                    for name in ('type', 'value', 'attribute_name')
+                    if hasattr(value, name) and not value.is_property_readonly(name)
+                }
+    return node_properties
+
+
+def _modifier_parameter_owner(mod, identifier):
+    if identifier.startswith('@/'):
+        path = identifier[2:].split('/')
+        if path[0] in {'inputs', 'outputs'}:
+            path.insert(0, 'properties')
+        owner = mod
+        for field in path[:-1]:
+            owner = owner[int(field)] if field.isdecimal() else getattr(owner, field)
+        return owner, path[-1]
+    return mod, identifier
+
+
+def _modifier_nested_parameters(mod):
+    values, visited = {}, set()
+
+    def collect(value, path):
+        if value is None or value.as_pointer() in visited:
+            return
+        visited.add(value.as_pointer())
+        for prop in value.bl_rna.properties:
+            if prop.identifier in {'rna_type', 'id_data'}:
+                continue
+            child = getattr(value, prop.identifier)
+            child_path = path + [prop.identifier]
+            if prop.is_readonly:
+                if prop.type == 'POINTER' and child is not None and not isinstance(child, bpy.types.ID):
+                    collect(child, child_path)
+                elif prop.type == 'COLLECTION':
+                    for index, item in enumerate(child):
+                        if not isinstance(item, bpy.types.ID):
+                            collect(item, child_path + [str(index)])
+            elif prop.type != 'COLLECTION':
+                values['@/' + '/'.join(child_path)] = child
+
+    for prop in mod.bl_rna.properties:
+        if (not prop.is_readonly or prop.type not in {'POINTER', 'COLLECTION'}
+                or prop.identifier in {'rna_type', 'id_data', 'properties', 'particle_system',
+                                       'bakes', 'node_warnings', 'panels'}):
+            continue
+        child = getattr(mod, prop.identifier)
+        if prop.type == 'POINTER' and child is not None and not isinstance(child, bpy.types.ID):
+            collect(child, [prop.identifier])
+        elif prop.type == 'COLLECTION':
+            for index, item in enumerate(child):
+                if not isinstance(item, bpy.types.ID):
+                    collect(item, [prop.identifier, str(index)])
+    return values
+
+
+def _get_modifier_parameter(mod, identifier):
+    owner, name = _modifier_parameter_owner(mod, identifier)
+    return getattr(owner, name)
+
+
+def _modifier_parameter_label(mod, identifier):
+    if mod is None:
+        return "参数"
+    if identifier.startswith('@/inputs/') or identifier.startswith('@/outputs/'):
+        if mod.node_group is None:
+            return "参数"
+        socket_id = identifier.split('/')[2]
+        socket = next((item for item in mod.node_group.interface.items_tree
+                       if item.item_type == 'SOCKET' and item.identifier == socket_id), None)
+        if socket is not None:
+            return socket.name
+    try:
+        owner, name = _modifier_parameter_owner(mod, identifier)
+        return bpy.app.translations.pgettext_iface(owner.bl_rna.properties[name].name)
+    except (AttributeError, KeyError):
+        return "参数"
+
+
+def _set_modifier_parameter(mod, identifier, value):
+    owner, name = _modifier_parameter_owner(mod, identifier)
+    prop = owner.bl_rna.properties[name]
+    if prop.type == 'ENUM' and prop.is_enum_flag:
+        value = set(value)
+    setattr(owner, name, value)
+
+
+def _modifier_description(mod):
+    try:
+        inputs = mod.items() if mod.type == 'NODES' else ()
+    except TypeError:
+        # Nodes modifiers without allocated input overrides have no IDProperties.
+        inputs = ()
+    return {
+        'name': mod.name, 'type': mod.type,
+        'node_properties': _modifier_node_properties(mod),
+        'nested_properties': {key: _modifier_history_value(value)
+                              for key, value in _modifier_nested_parameters(mod).items()},
+        'properties': {name: _modifier_history_value(getattr(mod, name))
+                       for name in ModifierAutoSync.get_snapshot(mod, include_display=True)
+                       if name in mod.bl_rna.properties and mod.bl_rna.properties[name].type != 'COLLECTION'},
+        'inputs': {name: _modifier_history_value(value) for name, value in inputs
+                   if not name.startswith('_')},
+    }
+
+
+def _create_synced_modifier(obj, description):
+    mod = obj.modifiers.new(name=description['name'], type=description['type'])
+    try:
+        for name, value in description['properties'].items():
+            if _modifier_history_value(_get_modifier_parameter(mod, name)) == value:
+                continue
+            if isinstance(value, dict):
+                value = _modifier_history_id(value)
+            _set_modifier_parameter(mod, name, value)
+        for name, value in description['inputs'].items():
+            mod[name] = _modifier_history_id(value) if isinstance(value, dict) else value
+        for name, value in description.get('nested_properties', {}).items():
+            if _modifier_history_value(_get_modifier_parameter(mod, name)) != value:
+                _set_modifier_parameter(mod, name,
+                                        _modifier_history_id(value) if isinstance(value, dict) else value)
+        for category, sockets in description.get('node_properties', {}).items():
+            for identifier, fields in sockets.items():
+                target = getattr(getattr(mod.properties, category), identifier)
+                for name, value in fields.items():
+                    setattr(target, name, _modifier_history_id(value) if isinstance(value, dict) else value)
+    except (AttributeError, TypeError, ValueError, RuntimeError):
+        obj.modifiers.remove(mod)
+        raise
+    return mod
+
+
+def _sync_added_modifiers(scene, source_obj, objects, queue_native=True):
+    operator = bpy.context.active_operator
+    if (queue_native and not bpy.app.background and operator is not None
+            and operator.bl_idname in {'OBJECT_OT_modifier_add', 'OBJECT_OT_modifier_add_node_group'}):
+        added = [mod for mod in source_obj.modifiers if _is_user_modifier(mod)
+                 and ModifierAutoSync.find_snapshot(scene, source_obj, mod) is None]
+        if added:
+            mod = added[-1]
+            _queue_modifier_operation(scene, source_obj, objects, mod.name, mod.type, operator)
+            return [], 0, set()
+    changes, added_count, skipped = [], 0, set()
+    for mod in source_obj.modifiers:
+        if not _is_user_modifier(mod) or ModifierAutoSync.find_snapshot(scene, source_obj, mod) is not None:
+            continue
+        targets = [obj for obj in objects if obj != source_obj]
+        # Existing modifiers must keep their settings. Reserve one common new
+        # name so subsequent parameter edits still use name/type matching.
+        conflicts = any(
+            (existing := obj.modifiers.get(mod.name)) is not None
+            and (ModifierAutoSync.find_snapshot(scene, obj, existing) is not None
+                 or existing.type != mod.type)
+            for obj in targets
+        )
+        if conflicts:
+            base, separator, suffix = mod.name.rpartition('.')
+            base = base if separator and suffix.isdigit() else mod.name
+            index = 1
+            while any(f'{base}.{index:03}' in obj.modifiers for obj in objects):
+                index += 1
+            mod.name = f'{base}.{index:03}'
+        description = _modifier_description(mod)
+        change = {'kind': 'ADD', 'source': source_obj.name,
+                  'source_uid': mod.persistent_uid, 'modifier': mod.name,
+                  'type': mod.type, 'property': '__presence__',
+                  'before': False, 'after': True, 'description': description,
+                  'targets': []}
+        for obj in targets:
+            if obj.modifiers.get(mod.name) is not None:
+                continue
+            try:
+                new_mod = _create_synced_modifier(obj, description)
+                change['targets'].append({'object': obj.name, 'uid': new_mod.persistent_uid})
+                added_count += 1
+            except (AttributeError, TypeError, ValueError, RuntimeError, OSError):
+                skipped.add(obj.name)
+        if change['targets']:
+            changes.append(change)
+    return changes, added_count, skipped
+
+
+def _sync_removed_modifiers(scene, source_obj, objects, depsgraph):
+    state = ModifierAutoSync.get_state(scene)
+    current = {mod.persistent_uid for mod in source_obj.modifiers}
+    removed = [(entry.modifier_name, entry.modifier_uid, entry.modifier_type)
+               for entry in state.snapshots
+               if entry.object_name == source_obj.name and entry.modifier_uid not in current]
+    operator = bpy.context.active_operator
+    native_name = (operator.properties.modifier if operator is not None
+                   and operator.bl_idname in {'OBJECT_OT_modifier_apply', 'OBJECT_OT_modifier_remove'} else None)
+    mesh_changed = any(update.id.original == source_obj.data and update.is_updated_geometry
+                       for update in depsgraph.updates)
+    changes, count, skipped = [], 0, set()
+    for name, uid, type_name in removed:
+        applying = mesh_changed and name == native_name and operator.bl_idname == 'OBJECT_OT_modifier_apply'
+        native_remove = name == native_name and operator is not None and operator.bl_idname == 'OBJECT_OT_modifier_remove'
+        if applying or native_remove:
+            _queue_modifier_operation(scene, source_obj, objects, name, type_name, operator)
+            continue
+        change = {'kind': 'REMOVE', 'source': source_obj.name, 'source_uid': uid,
+                  'modifier': name, 'type': type_name, 'property': '__presence__',
+                  'before': True, 'after': False, 'targets': []}
+        for obj in objects:
+            if obj == source_obj:
+                continue
+            mod = obj.modifiers.get(name)
+            if mod is None or mod.type != type_name:
+                continue
+            try:
+                change['targets'].append({'object': obj.name, 'uid': mod.persistent_uid,
+                                          'description': _modifier_description(mod)})
+                obj.modifiers.remove(mod)
+                count += 1
+            except (AttributeError, TypeError, ValueError, RuntimeError, OSError):
+                skipped.add(obj.name)
+        if change['targets']:
+            changes.append(change)
+    return changes, count, skipped
+
+
+def _queue_modifier_operation(scene, source, objects, name, type_name, operator):
+    history = _modifier_history(scene, create=True)
+    token = str(operator.as_pointer())
+    if history.last_operation_token == token:
+        return
+    history.last_operation_token = token
+    while len(history.changes) > history.change_cursor:
+        history.changes.remove(len(history.changes) - 1)
+    addition = operator.bl_idname in {'OBJECT_OT_modifier_add', 'OBJECT_OT_modifier_add_node_group'}
+    if operator.properties.use_selected_objects and not addition:
+        return
+    targets = [obj.name for obj in objects if obj != source
+               and (addition or ((mod := obj.modifiers.get(name)) is not None and mod.type == type_name))]
+    if not targets:
+        return
+    history.pending_operation = json.dumps({
+        'scene': scene.name, 'source': source.name, 'targets': targets,
+        'modifier': name, 'type': type_name, 'token': token,
+        'window': str(bpy.context.window.as_pointer()) if bpy.context.window else '',
+        'undo': bpy.context.preferences.edit.use_global_undo,
+        'addition': addition,
+        'operator': {'OBJECT_OT_modifier_apply': 'modifier_apply',
+                     'OBJECT_OT_modifier_remove': 'modifier_remove',
+                     'OBJECT_OT_modifier_add': 'modifier_add',
+                     'OBJECT_OT_modifier_add_node_group': 'modifier_add_node_group'}[operator.bl_idname],
+        'options': {key: getattr(operator.properties, key)
+                    for key in ('merge_customdata', 'single_user', 'all_keyframes', 'type',
+                                'asset_library_type', 'asset_library_identifier',
+                                'relative_asset_identifier', 'session_uid')
+                    if hasattr(operator.properties, key)},
+    })
+    if not bpy.app.timers.is_registered(_finish_modifier_operation):
+        bpy.app.timers.register(_finish_modifier_operation, first_interval=0.0)
+
+
+def _modifier_request_context(request):
+    window = next((win for win in bpy.context.window_manager.windows
+                   if str(win.as_pointer()) == request['window']), None)
+    if window is None:
+        return None
+    area = next((area for area in window.screen.areas
+                 if area.type in {'PROPERTIES', 'VIEW_3D'}), None)
+    if area is None:
+        return None
+    region = next(region for region in area.regions if region.type == 'WINDOW')
+    return {'window': window, 'area': area, 'region': region}
+
+
+def _finish_modifier_operation():
+    wm = bpy.context.window_manager
+    requests = []
+    for history in wm.um_modifier_sync_histories:
+        if history.pending_operation:
+            requests.append(json.loads(history.pending_operation))
+            history.pending_operation = ''
+    for request in requests:
+        label = '新增' if request['addition'] else ('应用' if request['operator'] == 'modifier_apply' else '删除')
+        scene = bpy.data.scenes.get(request['scene'])
+        override = _modifier_request_context(request)
+        if scene is None or not scene.um_auto_sync_modifiers or override is None:
+            continue
+        state = ModifierAutoSync.get_state(scene)
+        if not wm.operators or str(wm.operators[-1].as_pointer()) != request['token']:
+            state.warning_message = f"操作已改变，本次{label}未扩展到其他物体"
+            continue
+        # Replace the just-finished single-object step with Blender's own
+        # selected-object operation, preserving geometry and modifier data.
+        if request['undo']:
+            try:
+                with bpy.context.temp_override(**override):
+                    result = bpy.ops.ed.undo()
+            except RuntimeError:
+                result = {'CANCELLED'}
+            if 'FINISHED' not in result:
+                state.warning_message = f"无法准备多物体{label}，请检查撤销状态"
+                continue
+        scene = bpy.data.scenes.get(request['scene'])
+        history = _modifier_history(scene, create=True)
+        names = ([request['source']] if request['undo'] or request['addition'] else []) + request['targets']
+        objects = [obj for name in names if (obj := bpy.data.objects.get(name)) is not None
+                   and obj.is_editable and (request['addition'] or
+                       ((mod := obj.modifiers.get(request['modifier'])) is not None and mod.type == request['type']))]
+        if not objects:
+            continue
+        override = _modifier_request_context(request)
+        if override is None:
+            continue
+        history.is_restoring = True
+        try:
+            before = {
+                obj.name: {identifier: _modifier_history_value(_get_modifier_parameter(mod, identifier))
+                           for identifier in ModifierAutoSync.get_snapshot(mod)}
+                for obj in objects if not request['addition']
+                for mod in (obj.modifiers[request['modifier']],)
+            }
+            before_uids = {obj.name: {mod.persistent_uid for mod in obj.modifiers} for obj in objects}
+            with bpy.context.temp_override(**override, object=objects[0], active_object=objects[0],
+                                           selected_objects=objects, selected_editable_objects=objects):
+                if request['addition']:
+                    result = bpy.ops.object.uvmm_add_synced_native(
+                        'EXEC_DEFAULT', True, native_operator=request['operator'],
+                        options=json.dumps(request['options']),
+                        existing_modifier='' if request['undo'] else request['modifier'])
+                else:
+                    native_operator = getattr(bpy.ops.object, request['operator'])
+                    result = native_operator(
+                        'EXEC_DEFAULT', True, modifier=request['modifier'],
+                        use_selected_objects=True, **request['options'])
+                bpy.context.view_layer.update()
+            if not request['addition'] and 'FINISHED' in result:
+                change = {'kind': 'NATIVE_STACK', 'source': objects[0].name,
+                          'modifier': request['modifier'], 'type': request['type'],
+                          'property': '__presence__', 'before': True, 'after': False,
+                          'values': before, 'targets': []}
+                entry = history.changes.add()
+                entry.data = json.dumps([change])
+                while len(history.changes) > max(64, bpy.context.preferences.edit.undo_steps * 128):
+                    history.changes.remove(0)
+                history.change_cursor = len(history.changes)
+            modifier_sync_reset_handler()
+            state = ModifierAutoSync.get_state(scene)
+            applied = sum(any(mod.persistent_uid not in before_uids[obj.name] for mod in obj.modifiers)
+                          for obj in objects) if request['addition'] else sum(
+                request['modifier'] not in obj.modifiers for obj in objects)
+            state.status_message = f"已{label} {applied} 个物体的修改器"
+            skipped = len(names) - applied
+            if skipped:
+                state.warning_message = f"{skipped} 个物体未通过原生{label}检查"
+        finally:
+            history.is_restoring = False
+            history.last_operation_token = ''
+    return None
+
+
+def _modifier_history_id(value):
+    id_type = getattr(bpy.types, value['id_type'])
+    for prop in bpy.data.bl_rna.properties:
+        if prop.type != 'COLLECTION':
+            continue
+        collection = getattr(bpy.data, prop.identifier)
+        for candidate in collection:
+            if (isinstance(candidate, id_type) and candidate.name_full == value['name']
+                    and (candidate.library.filepath if candidate.library else '') == value['library']):
+                return candidate
+    raise ValueError('Referenced datablock no longer exists')
+
+
+def _history_modifier(change, object_name):
+    obj = bpy.data.objects.get(object_name)
+    if obj is None:
+        return None
+    if object_name == change['source'] and 'source_uid' in change:
+        mod = next((mod for mod in obj.modifiers
+                    if mod.persistent_uid == change['source_uid']), None)
+        if mod is None:
+            mod = obj.modifiers.get(change['modifier'])
+    else:
+        mod = obj.modifiers.get(change['modifier'])
+    return mod if mod is not None and mod.type == change['type'] else None
+
+
+def _history_key(change):
+    return json.dumps([change['source'], change['modifier'], change['type'], change['property']])
+
+
+def _participant_key(change, object_name):
+    return json.dumps([object_name, change['modifier'], change['type'], change['property']])
+
+
+@persistent
+def modifier_sync_undo_pre(*_args):
+    # Native RNA edits push their undo step before depsgraph callbacks write
+    # recipients. Keep those recipient edits paired with the source edit.
+    for history in bpy.context.window_manager.um_modifier_sync_histories:
+        baseline, participants = {}, {}
+        for entry in history.changes:
+            for change in json.loads(entry.data):
+                mod = _history_modifier(change, change['source'])
+                if change.get('kind') in {'ADD', 'REMOVE', 'NATIVE_STACK'}:
+                    baseline[_history_key(change)] = mod is not None
+                elif mod is not None:
+                    try:
+                        baseline[_history_key(change)] = ModifierAutoSync.serialize_value(
+                            _get_modifier_parameter(mod, change['property']))
+                    except AttributeError:
+                        continue
+                if change.get('kind') in {'ADD', 'REMOVE', 'NATIVE_STACK'}:
+                    continue
+                names = [change['source']] + [target['object'] for target in change['targets']]
+                for object_name in names:
+                    participant_mod = _history_modifier(change, object_name)
+                    if participant_mod is None:
+                        continue
+                    try:
+                        value = _modifier_history_value(_get_modifier_parameter(participant_mod, change['property']))
+                    except AttributeError:
+                        continue
+                    participants[_participant_key(change, object_name)] = {
+                        'source': object_name, 'source_uid': participant_mod.persistent_uid,
+                        'modifier': change['modifier'], 'type': change['type'],
+                        'property': change['property'], 'value': value,
+                    }
+        history.undo_baseline = json.dumps(baseline)
+        history.undo_participants = json.dumps(participants)
+        history.is_restoring = True
+
+
+def _restore_modifier_history(history, direction):
+    expected = json.loads(history.undo_baseline or '{}')
+    indices = (range(history.change_cursor - 1, -1, -1) if direction < 0
+               else range(history.change_cursor, len(history.changes)))
+    planned, records, valid_keys = [], {}, set()
+    old, new = ('after', 'before') if direction < 0 else ('before', 'after')
+    for index in indices:
+        changes = json.loads(history.changes[index].data)
+        records[index] = changes
+        for change in reversed(changes) if direction < 0 else changes:
+            key = _history_key(change)
+            mod = _history_modifier(change, change['source'])
+            if key not in expected:
+                continue
+            is_stack_change = change.get('kind') in {'ADD', 'REMOVE', 'NATIVE_STACK'}
+            if mod is None and not is_stack_change:
+                continue
+            try:
+                actual = (mod is not None if is_stack_change else
+                          ModifierAutoSync.serialize_value(_get_modifier_parameter(mod, change['property'])))
+            except AttributeError:
+                continue
+            if actual == expected[key] or expected[key] != change[old]:
+                continue
+            planned.append((index, change))
+            expected[key] = change[new]
+            if expected[key] == actual:
+                valid_keys.add(key)
+    # An unrelated native edit can invalidate a redo branch. Replay only
+    # complete journal paths which explain the source's actual restored value.
+    protected = set()
+    for _, change in planned:
+        if _history_key(change) in valid_keys:
+            protected.add(_participant_key(change, change['source']))
+            protected.update(_participant_key(change, target['object']) for target in change['targets'])
+    for key, participant in json.loads(history.undo_participants or '{}').items():
+        if key in protected:
+            continue
+        mod = _history_modifier(participant, participant['source'])
+        if mod is None:
+            continue
+        value = participant['value']
+        try:
+            if _modifier_history_value(_get_modifier_parameter(mod, participant['property'])) != value:
+                _set_modifier_parameter(mod, participant['property'],
+                                        _modifier_history_id(value) if isinstance(value, dict) else value)
+        except (AttributeError, TypeError, ValueError, RuntimeError):
+            continue
+    for index, change in planned:
+        if _history_key(change) not in valid_keys:
+            continue
+        if change.get('kind') in {'ADD', 'REMOVE', 'NATIVE_STACK'}:
+            _restore_added_modifier(history, change, direction)
+        else:
+            for target in change['targets']:
+                target_mod = _history_modifier(change, target['object'])
+                if target_mod is None:
+                    continue
+                value = target[new]
+                try:
+                    if isinstance(value, dict):
+                        value = _modifier_history_id(value)
+                    _set_modifier_parameter(target_mod, change['property'], value)
+                except (AttributeError, TypeError, ValueError, RuntimeError):
+                    continue
+        history.changes[index].data = json.dumps(records[index])
+        history.change_cursor = index if direction < 0 else index + 1
+
+
+def _restore_added_modifier(history, change, direction):
+    should_exist = change['after'] if direction > 0 else change['before']
+    if change['kind'] == 'NATIVE_STACK':
+        # Blender restores opaque modifier/mesh data; repair only the RNA
+        # values written after an earlier native parameter undo snapshot.
+        if should_exist:
+            for object_name, values in change['values'].items():
+                mod = _history_modifier(change, object_name)
+                if mod is None:
+                    continue
+                for identifier, value in values.items():
+                    try:
+                        _set_modifier_parameter(mod, identifier,
+                                                _modifier_history_id(value) if isinstance(value, dict) else value)
+                    except (AttributeError, TypeError, ValueError, RuntimeError):
+                        continue
+        return
+    if change['kind'] == 'ADD' and direction > 0:
+        source = _history_modifier(change, change['source'])
+        if source is not None:
+            source.name = change['modifier']
+    for target in change['targets']:
+        obj = bpy.data.objects.get(target['object'])
+        if obj is None:
+            continue
+        mod = next((mod for mod in obj.modifiers if mod.persistent_uid == target['uid']), None)
+        if mod is None:
+            mod = obj.modifiers.get(change['modifier'])
+        if not should_exist:
+            if mod is not None and mod.type == change['type']:
+                obj.modifiers.remove(mod)
+        elif mod is None:
+            try:
+                description = target.get('description', change.get('description'))
+                mod = _create_synced_modifier(obj, description)
+                target['uid'] = mod.persistent_uid
+            except (AttributeError, TypeError, ValueError, RuntimeError):
+                continue
+
+
+def _restore_modifier_sync_history(direction):
+    histories = bpy.context.window_manager.um_modifier_sync_histories
+    try:
+        for history in histories:
+            scene = bpy.data.scenes.get(history.scene_name)
+            if scene is not None and scene.um_auto_sync_modifiers:
+                _restore_modifier_history(history, direction)
+        modifier_sync_reset_handler()
+    finally:
+        for history in histories:
+            history.is_restoring = False
+
+
+@persistent
+def modifier_sync_undo_post(*_args):
+    _restore_modifier_sync_history(-1)
+
+
+@persistent
+def modifier_sync_redo_post(*_args):
+    _restore_modifier_sync_history(1)
+
+
+def update_modifier_sync_enabled(scene, context):
+    state = ModifierAutoSync.get_state(scene)
+    if state is None:
+        return
+    state.snapshots.clear()
+    state.selection_signature = ""
+    state.status_message = ""
+    state.warning_message = ""
+    if not scene.um_auto_sync_modifiers:
+        return
+    active = context.view_layer.objects.active
+    objects = [obj for obj in context.selected_objects if obj.type == 'MESH']
+    if active is not None and active.type == 'MESH' and objects:
+        state.selection_signature = json.dumps(
+            (active.name, tuple(sorted(obj.name for obj in objects)))
+        )
+        ModifierAutoSync.ensure_snapshots(scene, objects)
+
+
+def on_modifier_sync_toggle(scene, context):
+    history = _modifier_history(scene)
+    if history is not None:
+        while len(history.changes) > history.change_cursor:
+            history.changes.remove(len(history.changes) - 1)
+    update_modifier_sync_enabled(scene, context)
+
+
+def draw_modifier_sync_controls(layout, context):
+    enabled = context.scene.um_auto_sync_modifiers
+    objects = [obj for obj in context.selected_objects if obj.type == 'MESH']
+    if not objects and context.object and context.object.type == 'MESH':
+        objects = [context.object]
+    count = len(objects)
+    text = "同步已开启" if enabled else "同步已关闭"
+    split = layout.split(factor=0.4, align=True)
+    toggle_row = split.row(align=True)
+    toggle_row.alert = enabled
+    toggle_row.prop(context.scene, "um_auto_sync_modifiers",
+                    text=text, icon='LINKED' if enabled else 'UNLINKED', toggle=True)
+    state = ModifierAutoSync.get_state(context.scene)
+    messages = [message for message in (state.status_message, state.warning_message) if message] if state else []
+    draw_status_tooltip(split.row(align=True), '；'.join(messages) if messages else f"已选 {count} 个物体")
+
+
+class DATA_PT_UVMMModifierSync(Panel):
+    bl_label = "修改器同步"
+    bl_space_type = 'PROPERTIES'
+    bl_region_type = 'WINDOW'
+    bl_context = 'modifier'
+    bl_options = {'HIDE_HEADER'}
+    bl_order = -1000
+
+    @classmethod
+    def poll(cls, context):
+        return context.object is not None and context.object.type == 'MESH'
+
+    def draw(self, context):
+        layout = self.layout
+        draw_modifier_sync_controls(layout, context)
 
 
 # =========================================================================
 # 操作符定义
 # =========================================================================
+
+class MODIFIER_OT_AddSyncedNative(Operator):
+    bl_idname = "object.uvmm_add_synced_native"
+    bl_label = "同步新增修改器"
+    bl_options = {'REGISTER', 'UNDO', 'INTERNAL'}
+
+    native_operator: StringProperty(default='modifier_add', options={'HIDDEN'})
+    options: StringProperty(default='{"type":"SUBSURF"}', options={'HIDDEN'})
+    existing_modifier: StringProperty(options={'HIDDEN'})
+
+    @classmethod
+    def poll(cls, context):
+        return context.object is not None and context.object.type == 'MESH'
+
+    def execute(self, context):
+        scene = context.scene
+        objects = [obj for obj in context.selected_objects if obj.type == 'MESH' and obj.is_editable]
+        history = _modifier_history(scene, create=True)
+        previous = history.is_restoring
+        history.is_restoring = True
+        try:
+            ModifierAutoSync.ensure_snapshots(scene, objects)
+            if self.existing_modifier:
+                ModifierAutoSync.remove_snapshot(scene, context.object, self.existing_modifier)
+            else:
+                if self.native_operator not in {'modifier_add', 'modifier_add_node_group'}:
+                    return {'CANCELLED'}
+                result = getattr(bpy.ops.object, self.native_operator)(
+                    'EXEC_DEFAULT', False, use_selected_objects=False, **json.loads(self.options))
+                if 'FINISHED' not in result:
+                    return result
+            _, count, skipped = _sync_added_modifiers(scene, context.object, objects, queue_native=False)
+            context.view_layer.update()
+            ModifierAutoSync.ensure_snapshots(scene, objects)
+            if skipped:
+                self.report({'WARNING'}, f"已跳过 {len(skipped)} 个无法新增修改器的物体")
+            return {'FINISHED'}
+        finally:
+            history.is_restoring = previous
+
 
 class MODIFIER_OT_SelectByModifier(Operator):
     """在场景中选中所有使用该修改器的物体"""
@@ -1338,11 +2130,7 @@ def draw_modifiers_section(layout, context):
         # 2. 修改器名称（可直接修改）
         header.prop(mod, "name", text="")
 
-        # 3. 多物体覆盖统计 (如 2/4 或 4/4)
-        if selected_count > 1:
-            header.label(text=f"({has_count}/{selected_count})")
-
-        # 4. 右侧控制图标组（完全对齐官方原生蓝底高亮与标准图标）
+        # 3. 右侧控制图标组（完全对齐官方原生蓝底高亮与标准图标）
         right_group = header.row(align=True)
         right_group.alignment = 'RIGHT'
 
@@ -1377,6 +2165,8 @@ def draw_modifiers_section(layout, context):
 # =========================================================================
 
 classes = (
+    DATA_PT_UVMMModifierSync,
+    MODIFIER_OT_AddSyncedNative,
     UMM_OT_StatusTooltip,
     MODIFIER_OT_SelectByModifier,
     MODIFIER_OT_ToggleExpanded,
@@ -1393,7 +2183,13 @@ classes = (
 
 def register():
     bpy.utils.register_class(ModifierSyncSnapshot)
+    bpy.utils.register_class(ModifierSyncChange)
+    bpy.utils.register_class(ModifierSyncHistory)
     bpy.utils.register_class(ModifierSyncRuntimeState)
+
+    bpy.types.WindowManager.um_modifier_sync_histories = CollectionProperty(
+        type=ModifierSyncHistory, options={'SKIP_SAVE'}
+    )
 
     bpy.types.Scene.um_modifier_sync_state = PointerProperty(
         type=ModifierSyncRuntimeState,
@@ -1401,25 +2197,43 @@ def register():
     )
     bpy.types.Scene.um_auto_sync_modifiers = BoolProperty(
         name="自动同步修改器参数",
-        description="修改活动物体修改器的某项参数时，自动同步该项参数到所有选中的物体",
-        default=True
+        description="在原生修改器面板调整参数时，同步到其他选中物体上同名、同类型的修改器",
+        default=False,
+        update=on_modifier_sync_toggle,
     )
 
     for cls in classes:
         bpy.utils.register_class(cls)
 
+
     if depsgraph_update_handler not in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.append(depsgraph_update_handler)
-    for handler_list in (bpy.app.handlers.load_post, bpy.app.handlers.undo_post, bpy.app.handlers.redo_post):
-        if modifier_sync_reset_handler not in handler_list:
-            handler_list.append(modifier_sync_reset_handler)
+    if modifier_sync_load_post not in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.append(modifier_sync_load_post)
+    for handler_list, handler in (
+        (bpy.app.handlers.undo_pre, modifier_sync_undo_pre),
+        (bpy.app.handlers.redo_pre, modifier_sync_undo_pre),
+        (bpy.app.handlers.undo_post, modifier_sync_undo_post),
+        (bpy.app.handlers.redo_post, modifier_sync_redo_post),
+    ):
+        if handler not in handler_list:
+            handler_list.append(handler)
 
 def unregister():
+    if bpy.app.timers.is_registered(_finish_modifier_operation):
+        bpy.app.timers.unregister(_finish_modifier_operation)
     if depsgraph_update_handler in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.remove(depsgraph_update_handler)
-    for handler_list in (bpy.app.handlers.load_post, bpy.app.handlers.undo_post, bpy.app.handlers.redo_post):
-        if modifier_sync_reset_handler in handler_list:
-            handler_list.remove(modifier_sync_reset_handler)
+    if modifier_sync_load_post in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(modifier_sync_load_post)
+    for handler_list, handler in (
+        (bpy.app.handlers.undo_pre, modifier_sync_undo_pre),
+        (bpy.app.handlers.redo_pre, modifier_sync_undo_pre),
+        (bpy.app.handlers.undo_post, modifier_sync_undo_post),
+        (bpy.app.handlers.redo_post, modifier_sync_redo_post),
+    ):
+        if handler in handler_list:
+            handler_list.remove(handler)
 
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
@@ -1428,6 +2242,10 @@ def unregister():
         del bpy.types.Scene.um_auto_sync_modifiers
     if hasattr(bpy.types.Scene, "um_modifier_sync_state"):
         del bpy.types.Scene.um_modifier_sync_state
+    if hasattr(bpy.types.WindowManager, "um_modifier_sync_histories"):
+        del bpy.types.WindowManager.um_modifier_sync_histories
 
     bpy.utils.unregister_class(ModifierSyncRuntimeState)
+    bpy.utils.unregister_class(ModifierSyncHistory)
+    bpy.utils.unregister_class(ModifierSyncChange)
     bpy.utils.unregister_class(ModifierSyncSnapshot)

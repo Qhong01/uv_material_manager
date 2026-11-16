@@ -864,6 +864,7 @@ class OUTLINER_OT_ToggleOperator(Operator):
     bl_idname = "view3d.toggle_outliner"
     bl_label = "切换大纲视图"
     bl_description = "切换大纲视图与属性视图的显示与隐藏"
+    force_open: BoolProperty(name="强制打开", default=False, options={'HIDDEN'})
 
     @classmethod
     def poll(cls, context):
@@ -877,6 +878,45 @@ class OUTLINER_OT_ToggleOperator(Operator):
         if not win or not win.screen:
             self.report({'ERROR'}, "无法获取屏幕上下文")
             return {'CANCELLED'}
+
+        if getattr(win.screen, 'show_fullscreen', False):
+            # Leave the temporary maximized screen first. On the next UI tick,
+            # discard the add-on's old secondary editor and open only Outliner.
+            try:
+                bpy.ops.screen.back_to_previous('EXEC_DEFAULT')
+            except RuntimeError as exc:
+                self.report({'ERROR'}, f"无法退出最大化视口: {exc}")
+                return {'CANCELLED'}
+
+            from .workspace import close_secondary_area, get_or_detect_secondary_area, get_safe_window_and_screen
+            restored_window, restored_screen = get_safe_window_and_screen(context)
+            previous_secondary = get_or_detect_secondary_area(
+                restored_screen,
+                getattr(context.window_manager, 'um_secondary_area_ptr', ''),
+            )
+            if previous_secondary:
+                # Remove the previous editor before Blender redraws the restored
+                # screen, so it never flashes alongside the requested Outliner.
+                close_secondary_area(context)
+
+            def open_outliner_after_restore():
+                current_window, current_screen = get_safe_window_and_screen(bpy.context)
+                if not current_window or not current_screen:
+                    return None
+                if getattr(current_screen, 'show_fullscreen', False):
+                    return 0.02
+                current_3d = next((area for area in current_screen.areas if area.type == 'VIEW_3D'), None)
+                if current_3d:
+                    with bpy.context.temp_override(
+                        window=current_window,
+                        screen=current_screen,
+                        area=current_3d,
+                    ):
+                        bpy.ops.view3d.toggle_outliner('EXEC_DEFAULT', force_open=True)
+                return None
+
+            bpy.app.timers.register(open_outliner_after_restore, first_interval=0.05)
+            return {'FINISHED'}
 
         def detect_existing_outliner_properties_pair():
             areas = win.screen.areas
@@ -961,8 +1001,9 @@ class OUTLINER_OT_ToggleOperator(Operator):
             outliner_state.is_open = False
             outliner_state.area_ptr1 = ""
             outliner_state.area_ptr2 = ""
-            self.report({'INFO'}, "大纲视图已关闭")
-            return {'FINISHED'}
+            if not self.force_open:
+                self.report({'INFO'}, "大纲视图已关闭")
+                return {'FINISHED'}
 
         view3d_area = next((a for a in win.screen.areas if a.type == 'VIEW_3D'), None)
         if not view3d_area:

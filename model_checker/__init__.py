@@ -26,6 +26,8 @@ from . import diagnostic, native_preview, overlay, operators, panel
 _REQUIRED_OPERATOR_CLASSES = (
     "MC_OT_check_ngons",
     "MC_OT_check_isolated_vertices",
+    "MC_OT_check_collapsed_uv",
+    "MC_OT_check_model_boundaries",
     "MC_OT_toggle_uv_overlay",
     "MC_OT_uv_checks",
     "MC_OT_settings_popup",
@@ -64,7 +66,7 @@ def _schedule_preferences_save(_self=None, _context=None):
         bpy.app.timers.register(_save_user_preferences, first_interval=0.5)
 
 
-def _sync_scene_overlay(scene, prefs):
+def _sync_scene_overlay(scene, prefs, force_refresh=True):
     if not hasattr(scene, "model_checker_state"):
         return
     scene_state = scene.model_checker_state
@@ -79,19 +81,21 @@ def _sync_scene_overlay(scene, prefs):
         "uv_orientation_front_color", "uv_orientation_back_color",
     ):
         setattr(scene_state, name, getattr(prefs, name))
+    scene_state.uv_display_mode = prefs.uv_display_mode
     scene_state.overlay_active = any((
         scene_state.uv_show_stretch,
         scene_state.uv_show_boundaries,
         scene_state.uv_show_checker,
         scene_state.uv_show_orientation,
     ))
-    scene_state.overlay_cache_dirty = True
-    diagnostic.mark_full_refresh(scene_state)
+    if force_refresh:
+        scene_state.overlay_cache_dirty = True
+        diagnostic.mark_full_refresh(scene_state)
 
 
-def _sync_all_scenes(prefs):
+def _sync_all_scenes(prefs, force_refresh=True):
     for scene in bpy.data.scenes:
-        _sync_scene_overlay(scene, prefs)
+        _sync_scene_overlay(scene, prefs, force_refresh=force_refresh)
 
 
 def _enforce_uv_display_exclusivity(prefs):
@@ -151,15 +155,32 @@ def _update_scene_overlay(self, context):
     if self.uv_display_mode == 'MATERIAL' and not self.uv_material_colors_initialized:
         self.uv_mode_normalizing = True
         try:
-            self.uv_material_base_color = (*self.uv_stretch_base_color, self.uv_stretch_opacity)
+            self.uv_material_base_color = (*self.uv_stretch_base_color, 0.0)
             self.uv_material_max_color = (*self.uv_stretch_max_color, self.uv_stretch_opacity)
-            self.uv_material_front_color = (*self.uv_orientation_front_color, self.uv_orientation_opacity)
+            self.uv_material_front_color = (*self.uv_orientation_front_color, 0.0)
             self.uv_material_back_color = (*self.uv_orientation_back_color, self.uv_orientation_opacity)
             self.uv_material_colors_initialized = True
         finally:
             self.uv_mode_normalizing = False
     _enforce_uv_display_exclusivity(self)
-    _sync_all_scenes(self)
+    style_only_material = (
+        self.uv_display_mode == 'MATERIAL'
+        and all(
+            not hasattr(scene, "model_checker_state")
+            or (
+                scene.model_checker_state.uv_display_mode == self.uv_display_mode
+                and scene.model_checker_state.uv_show_stretch == self.uv_show_stretch
+                and scene.model_checker_state.uv_show_checker == self.uv_show_checker
+                and scene.model_checker_state.uv_show_orientation == self.uv_show_orientation
+                and scene.model_checker_state.uv_checker_pattern == self.uv_checker_pattern
+                and scene.model_checker_state.uv_checker_custom_image == self.uv_checker_custom_image
+            )
+            for scene in bpy.data.scenes
+        )
+    )
+    _sync_all_scenes(self, force_refresh=not style_only_material)
+    if style_only_material:
+        native_preview.update_material_uniforms(self)
     show_diagnostics = any((
         self.uv_show_stretch,
         self.uv_show_checker,
@@ -174,7 +195,7 @@ def _update_scene_overlay(self, context):
     _schedule_preferences_save()
 
 
-_CHECKER_DEFAULT_DENSITY = 8
+_CHECKER_DEFAULT_DENSITY = 64
 
 
 def _checker_density_key(prefs):
@@ -256,20 +277,33 @@ def _update_checker_settings(self, context):
         return
     _remember_checker_density(self)
     deadline = time.monotonic() + 0.4
-    for scene in bpy.data.scenes:
-        if not hasattr(scene, "model_checker_state"):
-            continue
-        state = scene.model_checker_state
+    states = [
+        scene.model_checker_state for scene in bpy.data.scenes
+        if hasattr(scene, "model_checker_state")
+    ]
+    style_only_material = self.uv_display_mode == 'MATERIAL' and all(
+        state.uv_display_mode == self.uv_display_mode
+        and state.uv_show_checker == self.uv_show_checker
+        and state.uv_checker_pattern == self.uv_checker_pattern
+        and state.uv_checker_custom_image == self.uv_checker_custom_image
+        for state in states
+    )
+    for state in states:
         for name in (
             "uv_checker_opacity", "uv_checker_density",
             "uv_checker_color_a", "uv_checker_color_b",
             "uv_checker_pattern", "uv_checker_custom_image",
         ):
             setattr(state, name, getattr(self, name))
-        diagnostic.mark_full_refresh(state)
-        if self.uv_show_checker:
-            state.uv_display_defer_until = max(state.uv_display_defer_until, deadline)
-    diagnostic.start_refresh_timer()
+        state.uv_display_mode = self.uv_display_mode
+        if not style_only_material:
+            diagnostic.mark_full_refresh(state)
+            if self.uv_show_checker:
+                state.uv_display_defer_until = max(state.uv_display_defer_until, deadline)
+    if style_only_material:
+        native_preview.update_material_uniforms(self)
+    else:
+        diagnostic.start_refresh_timer()
     _schedule_preferences_save()
 
 
@@ -363,7 +397,7 @@ def _suspend_native_before_undo(_dummy):
         if hasattr(scene, 'model_checker_state'):
             state = scene.model_checker_state
             state.refresh_in_progress = True
-            state.uv_native_scratch = None
+            state.uv_native_scratch = ''
             state.uv_native_materials.clear()
     native_preview.remove_all()
     # Flush removal before undo frees the old material/node-tree evaluations.
@@ -389,8 +423,10 @@ def _refresh_native_after_undo(_dummy):
 
 
 class MC_PG_native_material(bpy.types.PropertyGroup):
-    source: PointerProperty(type=bpy.types.Material, options={'SKIP_SAVE'})
-    material: PointerProperty(type=bpy.types.Material, options={'SKIP_SAVE'})
+    # Transient preview IDs can disappear across undo. Names are resolved
+    # against the current Main instead of embedding their pointers in Scene.
+    source: StringProperty(options={'SKIP_SAVE'})
+    material: StringProperty(options={'SKIP_SAVE'})
     signature: StringProperty(options={'SKIP_SAVE'})
     key: StringProperty(options={'SKIP_SAVE'})
 
@@ -427,28 +463,32 @@ class MC_PG_scene_state(bpy.types.PropertyGroup):
     uv_display_refresh_cursor: IntProperty(default=0, options={'SKIP_SAVE'})
     uv_display_defer_until: FloatProperty(default=0.0, options={'SKIP_SAVE'})
     uv_native_materials: CollectionProperty(type=MC_PG_native_material, options={'SKIP_SAVE'})
-    uv_native_scratch: PointerProperty(type=bpy.types.Mesh, options={'SKIP_SAVE'})
+    uv_native_scratch: StringProperty(options={'SKIP_SAVE'})
     native_resume: BoolProperty(default=False, options={'SKIP_SAVE'})
     uv_mesh_states: CollectionProperty(type=MC_PG_mesh_state, options={'SKIP_SAVE'})
     refresh_in_progress: BoolProperty(default=False, options={'SKIP_SAVE'})
+    uv_display_mode: EnumProperty(
+        items=(('CLASSIC', "实体", ""), ('MATERIAL', "材质", "")),
+        default='CLASSIC', options={'SKIP_SAVE'},
+    )
     uv_show_stretch: BoolProperty(default=False, options={'SKIP_SAVE'})
     uv_stretch_opacity: FloatProperty(default=0.85, min=0.0, max=1.0, options={'SKIP_SAVE'})
     uv_stretch_base_color: FloatVectorProperty(size=3, subtype='COLOR', default=(0.43, 0.78, 1.0), min=0.0, max=1.0, options={'SKIP_SAVE'})
     uv_stretch_max_color: FloatVectorProperty(size=3, subtype='COLOR', default=(1.0, 0.0, 0.0), min=0.0, max=1.0, options={'SKIP_SAVE'})
     uv_stretch_strength: FloatProperty(default=2.0, min=0.25, max=8.0, options={'SKIP_SAVE'})
-    uv_stretch_threshold: FloatProperty(default=0.0, min=0.0, max=0.999, subtype='PERCENTAGE', options={'SKIP_SAVE'})
+    uv_stretch_threshold: FloatProperty(default=0.2, min=0.0, max=0.999, subtype='PERCENTAGE', options={'SKIP_SAVE'})
     uv_show_boundaries: BoolProperty(default=False, options={'SKIP_SAVE'})
     uv_boundary_color: FloatVectorProperty(size=3, subtype='COLOR', default=(1.0, 0.55, 0.08), min=0.0, max=1.0, options={'SKIP_SAVE'})
     uv_boundary_width: FloatProperty(default=4.0, min=1.0, max=12.0, options={'SKIP_SAVE'})
     uv_show_checker: BoolProperty(default=False, options={'SKIP_SAVE'})
     uv_checker_opacity: FloatProperty(default=0.75, min=0.0, max=1.0, options={'SKIP_SAVE'})
-    uv_checker_density: IntProperty(default=8, min=1, max=256, options={'SKIP_SAVE'})
+    uv_checker_density: IntProperty(default=64, min=1, max=256, options={'SKIP_SAVE'})
     uv_checker_color_a: FloatVectorProperty(size=3, subtype='COLOR', default=(0.95, 0.95, 0.95), min=0.0, max=1.0, options={'SKIP_SAVE'})
     uv_checker_color_b: FloatVectorProperty(size=3, subtype='COLOR', default=(0.12, 0.12, 0.12), min=0.0, max=1.0, options={'SKIP_SAVE'})
     uv_checker_pattern: EnumProperty(items=diagnostic.CHECKER_PATTERN_ITEMS, default='CLASSIC', options={'SKIP_SAVE'})
     uv_checker_custom_image: StringProperty(default="", subtype='FILE_PATH', options={'SKIP_SAVE'})
     uv_show_orientation: BoolProperty(default=False, options={'SKIP_SAVE'})
-    uv_orientation_opacity: FloatProperty(default=0.9, min=0.0, max=1.0, options={'SKIP_SAVE'})
+    uv_orientation_opacity: FloatProperty(default=0.8, min=0.0, max=1.0, options={'SKIP_SAVE'})
     uv_orientation_front_color: FloatVectorProperty(size=3, subtype='COLOR', default=(0.43, 0.78, 1.0), min=0.0, max=1.0, options={'SKIP_SAVE'})
     uv_orientation_back_color: FloatVectorProperty(size=3, subtype='COLOR', default=(0.94, 0.045, 0.055), min=0.0, max=1.0, options={'SKIP_SAVE'})
     preview_shading_saved: BoolProperty(default=False, options={'SKIP_SAVE'})
@@ -486,10 +526,10 @@ class MC_AddonPreferences(bpy.types.AddonPreferences):
         default='MATERIAL', update=_update_uv_display_mode)
     uv_display_mode_version: IntProperty(default=0, options={'HIDDEN'})
     uv_material_colors_initialized: BoolProperty(default=False, options={'HIDDEN'})
-    uv_material_base_color: FloatVectorProperty(name="无拉伸颜色", size=4, subtype='COLOR', default=(.43,.78,1,.85), min=0, max=1, update=_update_scene_overlay)
+    uv_material_base_color: FloatVectorProperty(name="无拉伸颜色", size=4, subtype='COLOR', default=(.43,.78,1,0.0), min=0, max=1, update=_update_scene_overlay)
     uv_material_max_color: FloatVectorProperty(name="最大拉伸颜色", size=4, subtype='COLOR', default=(1,0,0,.85), min=0, max=1, update=_update_scene_overlay)
-    uv_material_front_color: FloatVectorProperty(name="正向颜色", size=4, subtype='COLOR', default=(.43,.78,1,.9), min=0, max=1, update=_update_scene_overlay)
-    uv_material_back_color: FloatVectorProperty(name="反向颜色", size=4, subtype='COLOR', default=(.94,.045,.055,.9), min=0, max=1, update=_update_scene_overlay)
+    uv_material_front_color: FloatVectorProperty(name="正向颜色", size=4, subtype='COLOR', default=(.43,.78,1,0.0), min=0, max=1, update=_update_scene_overlay)
+    uv_material_back_color: FloatVectorProperty(name="反向颜色", size=4, subtype='COLOR', default=(.94,.045,.055,.8), min=0, max=1, update=_update_scene_overlay)
     uv_mode_normalizing: BoolProperty(default=False, options={'HIDDEN', 'SKIP_SAVE'})
     ngon_clear_selection: BoolProperty(name="运行前清除其他选择", default=True)
     ngon_sides: IntProperty(name="边数大于", description="顶点数超过此值的面会被选中", default=4, min=3, max=100)
@@ -498,17 +538,17 @@ class MC_AddonPreferences(bpy.types.AddonPreferences):
     uv_stretch_base_color: FloatVectorProperty(name="无拉伸颜色", subtype='COLOR', size=3, default=(0.43, 0.78, 1.0), min=0.0, max=1.0, update=_update_scene_overlay)
     uv_stretch_max_color: FloatVectorProperty(name="拉伸颜色", subtype='COLOR', size=3, default=(1.0, 0.0, 0.0), min=0.0, max=1.0, update=_update_scene_overlay)
     uv_stretch_strength: FloatProperty(name="拉伸显示强度", description="提高后较轻微的拉伸也会有更明显的颜色变化", default=2.0, min=0.25, max=8.0, update=_update_scene_overlay)
-    uv_stretch_threshold: FloatProperty(name="可接受拉伸阈值", description="低于此阈值的拉伸按无拉伸颜色显示", default=0.0, min=0.0, max=0.999, subtype='PERCENTAGE', update=_update_scene_overlay)
+    uv_stretch_threshold: FloatProperty(name="可接受拉伸阈值", description="低于此阈值的拉伸按无拉伸颜色显示", default=0.2, min=0.0, max=0.999, subtype='PERCENTAGE', update=_update_scene_overlay)
     uv_show_boundaries: BoolProperty(name="显示 UV 分界边", default=False, update=_update_scene_overlay)
     uv_boundary_color: FloatVectorProperty(name="边界颜色", subtype='COLOR', size=3, default=(1.0, 0.55, 0.08), min=0.0, max=1.0, update=_update_scene_overlay)
     uv_boundary_width: FloatProperty(name="分界线粗细", default=4.0, min=1.0, max=12.0, update=_update_boundary_width)
     uv_show_checker: BoolProperty(name="显示棋盘格", default=False, update=_update_uv_checker)
     uv_checker_opacity: FloatProperty(name="棋盘格透明度", default=0.75, min=0.0, max=1.0, update=_update_checker_settings)
-    uv_checker_density: IntProperty(name="棋盘格密度", default=8, min=1, max=256, update=_update_checker_settings)
+    uv_checker_density: IntProperty(name="棋盘格密度", default=64, min=1, max=256, update=_update_checker_settings)
     uv_checker_color_a: FloatVectorProperty(name="棋盘格颜色 A", subtype='COLOR', size=3, default=(0.95, 0.95, 0.95), min=0.0, max=1.0, update=_update_checker_settings)
     uv_checker_color_b: FloatVectorProperty(name="棋盘格颜色 B", subtype='COLOR', size=3, default=(0.12, 0.12, 0.12), min=0.0, max=1.0, update=_update_checker_settings)
     uv_show_orientation: BoolProperty(name="显示 UV 正反", default=False, update=_update_uv_orientation)
-    uv_orientation_opacity: FloatProperty(name="UV 正反透明度", default=0.9, min=0.0, max=1.0, update=_update_scene_overlay)
+    uv_orientation_opacity: FloatProperty(name="UV 正反透明度", default=0.8, min=0.0, max=1.0, update=_update_scene_overlay)
     uv_orientation_front_color: FloatVectorProperty(name="正向颜色", subtype='COLOR', size=3, default=(0.43, 0.78, 1.0), min=0.0, max=1.0, update=_update_scene_overlay)
     uv_orientation_back_color: FloatVectorProperty(name="反向颜色", subtype='COLOR', size=3, default=(0.94, 0.045, 0.055), min=0.0, max=1.0, update=_update_scene_overlay)
     isolated_include_hidden: BoolProperty(name="包括隐藏顶点", default=False)
@@ -550,6 +590,8 @@ CLASSES = (
     MC_PG_scene_state,
     operators.MC_OT_check_ngons,
     operators.MC_OT_check_isolated_vertices,
+    operators.MC_OT_check_collapsed_uv,
+    operators.MC_OT_check_model_boundaries,
     operators.MC_OT_toggle_uv_overlay,
     operators.MC_OT_uv_checks,
     operators.MC_OT_settings_popup,
@@ -608,6 +650,30 @@ def _migrate_overlay_opacity_defaults():
     prefs.uv_overlay_tuning_version = 6
 
 
+def _migrate_check_display_defaults(prefs):
+    if prefs.uv_overlay_tuning_version >= 9:
+        return
+    if prefs.uv_overlay_tuning_version < 7:
+        for name, old_alpha in (('uv_material_base_color', 0.85), ('uv_material_front_color', 0.9)):
+            color = tuple(getattr(prefs, name))
+            if abs(color[3] - old_alpha) < 1e-6:
+                setattr(prefs, name, (*color[:3], 0.0))
+        densities = _read_checker_densities(prefs)
+        _write_checker_densities(prefs, {key: 64 if value == 8 else value for key, value in densities.items()})
+        if prefs.uv_checker_density == 8:
+            prefs.uv_checker_density = 64
+    if abs(prefs.uv_stretch_threshold) < 1e-6:
+        prefs.uv_stretch_threshold = 0.2
+    if prefs.uv_overlay_tuning_version < 9:
+        if abs(prefs.uv_orientation_opacity - 0.9) < 1e-6:
+            prefs.uv_orientation_opacity = 0.8
+        back_color = tuple(prefs.uv_material_back_color)
+        if len(back_color) == 4 and abs(back_color[3] - 0.9) < 1e-6:
+            prefs.uv_material_back_color = (*back_color[:3], 0.8)
+    prefs.uv_overlay_tuning_version = 9
+    _schedule_preferences_save()
+
+
 def migrate_preferences():
     """Copy the former stand-alone add-on preferences into this add-on once."""
     addon = bpy.context.preferences.addons.get(ADDON_ID)
@@ -630,6 +696,8 @@ def migrate_preferences():
         for name in setting_names:
             setattr(prefs, name, getattr(legacy_addon.preferences, name))
         prefs.model_checker_migrated = True
+    _migrate_overlay_opacity_defaults()
+    _migrate_check_display_defaults(prefs)
     import addon_utils
     addon_utils.disable("Model_Checker", default_set=True)
 
@@ -640,6 +708,7 @@ def _initialize_after_register():
     addon = bpy.context.preferences.addons.get(ADDON_ID)
     if addon is not None:
         prefs = addon.preferences
+        _migrate_check_display_defaults(prefs)
         if prefs.uv_display_mode_version < 1:
             prefs.uv_display_mode = 'MATERIAL'
             prefs.uv_display_mode_version = 1

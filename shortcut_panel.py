@@ -553,16 +553,14 @@ CLASSES = (
 )
 
 
-def register():
-    for cls in CLASSES:
-        try:
-            bpy.utils.register_class(cls)
-        except ValueError:
-            bpy.utils.unregister_class(cls)
-            bpy.utils.register_class(cls)
-    wm = bpy.context.window_manager
-    if wm is None:
-        return
+def _initialize_shortcuts():
+    wm = getattr(bpy.context, 'window_manager', None)
+    if wm is None or wm.keyconfigs.addon is None or wm.keyconfigs.user is None:
+        return 0.1
+    default = wm.keyconfigs.default
+    screen = default.keymaps.get('Screen') if default else None
+    if screen is None or not screen.keymap_items:
+        return 0.1
     # Settle the addon/user merge first: otherwise keys left over from a
     # previous load make _ensure_item skip defaults that are about to be
     # dropped by the update below.
@@ -573,9 +571,26 @@ def register():
                 _ensure_item(wm, spec)
     _ensure_layout_items(wm, workspace.load_json_config(), use_user_keymap=True)
     wm.keyconfigs.update()
+    return None
+
+
+def register():
+    for cls in CLASSES:
+        try:
+            bpy.utils.register_class(cls)
+        except ValueError:
+            bpy.utils.unregister_class(cls)
+            bpy.utils.register_class(cls)
+    # Startup loads the user's keyconfig after add-on registration. User
+    # bindings created inside register() are overwritten by that load.
+    if not bpy.app.timers.is_registered(_initialize_shortcuts):
+        bpy.app.timers.register(_initialize_shortcuts, first_interval=0.1,
+                                persistent=True)
 
 
 def unregister():
+    if bpy.app.timers.is_registered(_initialize_shortcuts):
+        bpy.app.timers.unregister(_initialize_shortcuts)
     wm = bpy.context.window_manager
     addon = wm.keyconfigs.addon if wm else None
     if addon is not None:

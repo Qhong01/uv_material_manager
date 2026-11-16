@@ -86,6 +86,10 @@ if "modeling_tools" in locals():
     importlib.reload(ui)
     importlib.reload(shading_manager)
     importlib.reload(modeling_tools)
+    if "alpha_generator" in locals():
+        importlib.reload(alpha_generator)
+    else:
+        from . import alpha_generator
 else:
     from . import workspace
     from . import utils
@@ -105,6 +109,7 @@ else:
     from . import ui
     from . import shading_manager
     from . import modeling_tools
+    from . import alpha_generator
 
 from .material_manager import MaterialTemplateManager
 
@@ -141,10 +146,10 @@ class UVMM_AddonPreferences(AddonPreferences):
         default='MATERIAL', update=model_checker._update_uv_display_mode)
     uv_display_mode_version: IntProperty(default=0, options={'HIDDEN'})
     uv_material_colors_initialized: BoolProperty(default=False, options={'HIDDEN'})
-    uv_material_base_color: FloatVectorProperty(name="无拉伸颜色", size=4, subtype='COLOR', default=(.43,.78,1,.85), min=0, max=1, update=model_checker._update_scene_overlay)
+    uv_material_base_color: FloatVectorProperty(name="无拉伸颜色", size=4, subtype='COLOR', default=(.43,.78,1,0.0), min=0, max=1, update=model_checker._update_scene_overlay)
     uv_material_max_color: FloatVectorProperty(name="最大拉伸颜色", size=4, subtype='COLOR', default=(1,0,0,.85), min=0, max=1, update=model_checker._update_scene_overlay)
-    uv_material_front_color: FloatVectorProperty(name="正向颜色", size=4, subtype='COLOR', default=(.43,.78,1,.9), min=0, max=1, update=model_checker._update_scene_overlay)
-    uv_material_back_color: FloatVectorProperty(name="反向颜色", size=4, subtype='COLOR', default=(.94,.045,.055,.9), min=0, max=1, update=model_checker._update_scene_overlay)
+    uv_material_front_color: FloatVectorProperty(name="正向颜色", size=4, subtype='COLOR', default=(.43,.78,1,0.0), min=0, max=1, update=model_checker._update_scene_overlay)
+    uv_material_back_color: FloatVectorProperty(name="反向颜色", size=4, subtype='COLOR', default=(.94,.045,.055,.8), min=0, max=1, update=model_checker._update_scene_overlay)
     uv_mode_normalizing: BoolProperty(default=False, options={'HIDDEN', 'SKIP_SAVE'})
     ngon_clear_selection: BoolProperty(name="运行前清除其他选择", default=True, update=model_checker._schedule_preferences_save)
     ngon_sides: IntProperty(name="边数大于", description="顶点数超过此值的面会被选中", default=4, min=3, max=100, update=model_checker._schedule_preferences_save)
@@ -153,13 +158,13 @@ class UVMM_AddonPreferences(AddonPreferences):
     uv_stretch_base_color: FloatVectorProperty(name="无拉伸颜色", subtype='COLOR', size=3, default=(0.43, 0.78, 1.0), min=0.0, max=1.0, update=model_checker._update_scene_overlay)
     uv_stretch_max_color: FloatVectorProperty(name="拉伸颜色", subtype='COLOR', size=3, default=(1.0, 0.0, 0.0), min=0.0, max=1.0, update=model_checker._update_scene_overlay)
     uv_stretch_strength: FloatProperty(name="拉伸显示强度", description="提高后较轻微的拉伸也会有更明显的颜色变化", default=2.0, min=0.25, max=8.0, update=model_checker._update_scene_overlay)
-    uv_stretch_threshold: FloatProperty(name="可接受拉伸阈值", description="低于此阈值的拉伸按无拉伸颜色显示", default=0.0, min=0.0, max=0.999, subtype='PERCENTAGE', update=model_checker._update_scene_overlay)
+    uv_stretch_threshold: FloatProperty(name="可接受拉伸阈值", description="低于此阈值的拉伸按无拉伸颜色显示", default=0.2, min=0.0, max=0.999, subtype='PERCENTAGE', update=model_checker._update_scene_overlay)
     uv_show_boundaries: BoolProperty(name="显示 UV 分界边", default=False, update=model_checker._update_scene_overlay)
     uv_boundary_color: FloatVectorProperty(name="边界颜色", subtype='COLOR', size=3, default=(1.0, 0.55, 0.08), min=0.0, max=1.0, update=model_checker._update_scene_overlay)
     uv_boundary_width: FloatProperty(name="分界线粗细", default=4.0, min=1.0, max=12.0, update=model_checker._update_boundary_width)
     uv_show_checker: BoolProperty(name="显示棋盘格", default=False, update=model_checker._update_uv_checker)
     uv_checker_opacity: FloatProperty(name="棋盘格透明度", default=0.75, min=0.0, max=1.0, update=model_checker._update_checker_settings)
-    uv_checker_density: IntProperty(name="棋盘格密度", default=8, min=1, max=256, update=model_checker._update_checker_settings)
+    uv_checker_density: IntProperty(name="棋盘格密度", default=64, min=1, max=256, update=model_checker._update_checker_settings)
     uv_checker_color_a: FloatVectorProperty(name="棋盘格颜色 A", subtype='COLOR', size=3, default=(0.95, 0.95, 0.95), min=0.0, max=1.0, update=model_checker._update_checker_settings)
     uv_checker_color_b: FloatVectorProperty(name="棋盘格颜色 B", subtype='COLOR', size=3, default=(0.12, 0.12, 0.12), min=0.0, max=1.0, update=model_checker._update_checker_settings)
     uv_checker_pattern: EnumProperty(
@@ -180,7 +185,7 @@ class UVMM_AddonPreferences(AddonPreferences):
     uv_checker_density_key: StringProperty(default="", options={'HIDDEN'})
     uv_checker_density_switching: BoolProperty(default=False, options={'HIDDEN', 'SKIP_SAVE'})
     uv_show_orientation: BoolProperty(name="显示 UV 正反", default=False, update=model_checker._update_uv_orientation)
-    uv_orientation_opacity: FloatProperty(name="UV 正反透明度", default=0.9, min=0.0, max=1.0, update=model_checker._update_scene_overlay)
+    uv_orientation_opacity: FloatProperty(name="UV 正反透明度", default=0.8, min=0.0, max=1.0, update=model_checker._update_scene_overlay)
     uv_orientation_front_color: FloatVectorProperty(name="正向颜色", subtype='COLOR', size=3, default=(0.43, 0.78, 1.0), min=0.0, max=1.0, update=model_checker._update_scene_overlay)
     uv_orientation_back_color: FloatVectorProperty(name="反向颜色", subtype='COLOR', size=3, default=(0.94, 0.045, 0.055), min=0.0, max=1.0, update=model_checker._update_scene_overlay)
     isolated_include_hidden: BoolProperty(name="包括隐藏顶点", default=False, update=model_checker._schedule_preferences_save)
@@ -253,6 +258,7 @@ def register():
     data_cleanup.register()
     smart_shortcuts.register()
     uv_bounds_checker.register()
+    alpha_generator.register()
     ui.register()
     shading_manager.register()
     modeling_tools.register()
@@ -268,6 +274,7 @@ def unregister():
     model_checker.unregister()
     shading_manager.unregister()
     ui.unregister()
+    alpha_generator.unregister()
     uv_bounds_checker.unregister()
     focus_tools.unregister()
     smart_shortcuts.unregister()

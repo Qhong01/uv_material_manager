@@ -290,6 +290,24 @@ class SHADING_OT_ResetObjectColor(Operator):
         return {'FINISHED'}
 
 
+class VIEW3D_PT_QuickShadingSettings(Panel):
+    bl_idname = "VIEW3D_PT_QuickShadingSettings"
+    bl_label = "光照设置"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'WINDOW'
+    bl_ui_units_x = 12
+
+    def draw(self, context):
+        shading = context.space_data.shading
+        col = self.layout.column(align=True)
+        row = col.row(align=True)
+        row.prop(shading, "use_studiolight_view_rotation", text="", icon='WORLD', toggle=True)
+        row.prop(shading, "studiolight_rotate_z", text="旋转")
+        col.prop(shading, "studiolight_intensity", text="强度")
+        col.prop(shading, "studiolight_background_alpha", text="世界不透明度")
+        col.prop(shading, "studiolight_background_blur", text="模糊")
+
+
 class VIEW3D_PT_QuickShadingPopover(Panel):
     bl_idname = "VIEW3D_PT_QuickShadingPopover"
     bl_label = "着色弹出菜单"
@@ -322,9 +340,12 @@ class VIEW3D_PT_QuickShadingPopover(Panel):
             row_light.prop_enum(shading, "light", 'FLAT', text="平面")
 
             if shading.light in {'STUDIO', 'MATCAP'}:
-                sub = box_view.row(align=True)
+                preview = box_view.split(factor=0.92, align=True)
+                sub = preview.column(align=True)
                 sub.scale_y = 0.65
                 sub.template_icon_view(shading, "studio_light", scale_popup=props.matcap_icon_scale)
+                preview.column(align=True).popover(
+                    panel="VIEW3D_PT_QuickShadingSettings", text="", icon='PREFERENCES')
 
             # 线框颜色：横排三按钮平铺
             if hasattr(shading, 'wireframe_color_type'):
@@ -334,12 +355,13 @@ class VIEW3D_PT_QuickShadingPopover(Panel):
                 row_wire.prop_enum(shading, "wireframe_color_type", 'RANDOM', text="随机")
 
             # 颜色：两行三列紧凑网格
-            row_c1 = box_view.row(align=True)
+            colors = box_view.column(align=True)
+            row_c1 = colors.row(align=True)
             row_c1.prop_enum(shading, "color_type", 'MATERIAL', text="材质")
             row_c1.prop_enum(shading, "color_type", 'RANDOM', text="随机")
             row_c1.prop_enum(shading, "color_type", 'TEXTURE', text="纹理")
 
-            row_c2 = box_view.row(align=True)
+            row_c2 = colors.row(align=True)
             row_c2.prop_enum(shading, "color_type", 'OBJECT', text="物体")
             row_c2.prop_enum(shading, "color_type", 'VERTEX', text="属性")
             row_c2.prop_enum(shading, "color_type", 'SINGLE', text="自定义")
@@ -392,11 +414,6 @@ class VIEW3D_PT_QuickShadingPopover(Panel):
                 btn = pal_row.operator("shading.set_object_color_index", text="", icon_value=icon_id)
                 btn.color_index = i
 
-            # 随机化颜色工具
-            col_tools = box_obj.column(align=True)
-            col_tools.operator("shading.randomize_object_color", text="随机化颜色", icon='COLOR')
-            col_tools.operator("shading.randomize_collection_color", text="为物体集合添加随机颜色", icon='GROUP')
-
             # 透明度行 (同时控制所有选中物体)
             alpha_row = box_obj.row(align=True)
             alpha_row.prop(props, "object_alpha", text="透明", slider=True)
@@ -410,6 +427,7 @@ classes = (
     SHADING_OT_RandomizeObjectColor,
     SHADING_OT_RandomizeCollectionColor,
     SHADING_OT_ResetObjectColor,
+    VIEW3D_PT_QuickShadingSettings,
     VIEW3D_PT_QuickShadingPopover,
 )
 

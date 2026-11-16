@@ -3,6 +3,8 @@
 import bpy
 import bmesh
 import types
+import math
+import numpy as np
 from bpy.props import (
     BoolProperty,
     EnumProperty,
@@ -252,6 +254,190 @@ def _tag_viewports(context):
             area.tag_redraw()
 
 
+def _collapsed_uv_faces(obj, tolerance):
+    """Read the active UV layer; a line or a small-area island is not a point."""
+    if obj.mode == 'EDIT':
+        bm = bmesh.from_edit_mesh(obj.data)
+        bm.verts.ensure_lookup_table()
+        bm.edges.ensure_lookup_table()
+        bm.faces.ensure_lookup_table()
+        bm.faces.index_update()
+        layer = bm.loops.layers.uv.active
+        if layer is None:
+            return None
+        indices = []
+        for face in bm.faces:
+            if face.hide or not face.loops:
+                continue
+            coords = [loop[layer].uv for loop in face.loops]
+            if not all(math.isfinite(value) for coord in coords for value in coord):
+                continue
+            width = max(coord.x for coord in coords) - min(coord.x for coord in coords)
+            height = max(coord.y for coord in coords) - min(coord.y for coord in coords)
+            if width * width + height * height < tolerance * tolerance:
+                indices.append(face.index)
+        return indices
+    mesh = obj.data
+    layer = mesh.uv_layers.active
+    if layer is None:
+        return None
+    if not mesh.polygons:
+        return []
+    coords = np.empty(len(mesh.loops) * 2, dtype=np.float64)
+    layer.uv.foreach_get('vector', coords)
+    coords = coords.reshape((-1, 2))
+    starts = np.empty(len(mesh.polygons), dtype=np.int32)
+    hidden = np.empty(len(mesh.polygons), dtype=bool)
+    mesh.polygons.foreach_get('loop_start', starts)
+    mesh.polygons.foreach_get('hide', hidden)
+    span = np.maximum.reduceat(coords, starts) - np.minimum.reduceat(coords, starts)
+    finite = np.logical_and.reduceat(np.isfinite(coords).all(axis=1), starts)
+    return np.flatnonzero((np.einsum('ij,ij->i', span, span) < tolerance * tolerance)
+                          & finite & ~hidden).tolist()
+
+
+def _model_boundary_findings(objects):
+    findings, cache = [], {}
+    for obj in objects:
+        if obj.type != 'MESH' or not obj.is_editable or not obj.data.is_editable:
+            continue
+        key = obj.data.as_pointer()
+        if key not in cache:
+            editing = obj.mode == 'EDIT'
+            bm = bmesh.from_edit_mesh(obj.data) if editing else bmesh.new()
+            try:
+                if not editing:
+                    bm.from_mesh(obj.data)
+                bm.verts.ensure_lookup_table()
+                bm.edges.ensure_lookup_table()
+                bm.faces.ensure_lookup_table()
+                bm.edges.index_update()
+                cache[key] = [edge.index for edge in bm.edges if not edge.hide and edge.is_boundary]
+            finally:
+                if not editing:
+                    bm.free()
+        if cache[key]:
+            findings.append((obj, cache[key]))
+    return findings
+
+
+def _select_model_boundaries(context, findings):
+    if not findings:
+        return
+    _ensure_object_mode(context)
+    for obj in context.selected_objects:
+        obj.select_set(False)
+    for obj, _ in findings:
+        obj.select_set(True)
+    context.view_layer.objects.active = findings[0][0]
+    bpy.ops.object.mode_set(mode='EDIT')
+    context.tool_settings.mesh_select_mode = (False, True, False)
+    unique = set()
+    for obj, edges in findings:
+        if obj.data.as_pointer() in unique:
+            continue
+        unique.add(obj.data.as_pointer())
+        bm = bmesh.from_edit_mesh(obj.data)
+        bm.verts.ensure_lookup_table()
+        bm.edges.ensure_lookup_table()
+        bm.faces.ensure_lookup_table()
+        _clear_selection(bm)
+        bm.select_history.clear()
+        for index in edges:
+            bm.edges[index].select_set(True)
+        bm.normal_update()
+        bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+
+
+class MC_OT_check_model_boundaries(bpy.types.Operator):
+    bl_idname = 'mesh.model_checker_check_model_boundaries'
+    bl_label = '检查模型边界'
+    bl_description = '进入边选择模式，选中所选模型的开放边界和孔洞边缘'
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return _has_selected_mesh(context) and context.mode in {'OBJECT', 'EDIT_MESH'}
+
+    def execute(self, context):
+        findings = _model_boundary_findings(_selected_meshes(context))
+        _select_model_boundaries(context, findings)
+        count = sum(len(edges) for _, edges in findings)
+        message = _check_result_message('模型边界', count, '边界边')
+        overlay.show_check_feedback(context, message, 'INFO' if count else 'WARNING')
+        self.report({'INFO'}, message)
+        _tag_viewports(context)
+        return {'FINISHED'}
+
+
+class MC_OT_check_collapsed_uv(bpy.types.Operator):
+    bl_idname = 'mesh.model_checker_check_collapsed_uv'
+    bl_label = '检查 UV 缩点'
+    bl_description = '检查当前 UV 层中全部 UV 坐标重合成一点的面；多物体选物体，单物体选问题面'
+    bl_options = {'REGISTER', 'UNDO'}
+
+    tolerance: FloatProperty(name='坐标容差', default=1e-6, min=1e-9, max=0.001, precision=6)
+
+    @classmethod
+    def poll(cls, context):
+        return (context.mode in {'OBJECT', 'EDIT_MESH'} and context.area is not None
+                and context.area.type == 'VIEW_3D')
+
+    def execute(self, context):
+        if context.mode == 'EDIT_MESH':
+            objects = tuple(obj for obj in context.objects_in_mode if obj.type == 'MESH')
+        else:
+            objects = _selected_meshes(context) or tuple(_visible_meshes(context))
+        findings, cache = [], {}
+        missing_uv = 0
+        skipped = 0
+        for obj in objects:
+            if not obj.is_editable or not obj.data.is_editable:
+                skipped += 1
+                continue
+            key = obj.data.as_pointer()
+            if key not in cache:
+                cache[key] = _collapsed_uv_faces(obj, self.tolerance)
+            indices = cache[key]
+            if indices is None:
+                missing_uv += 1
+            elif indices:
+                findings.append((obj, indices))
+        count = sum(len(indices) for _, indices in findings)
+        if findings:
+            _ensure_object_mode(context)
+            for obj in context.selected_objects:
+                obj.select_set(False)
+            for obj, _ in findings:
+                obj.select_set(True)
+            context.view_layer.objects.active = findings[0][0]
+            if len(findings) == 1:
+                obj, indices = findings[0]
+                bpy.ops.object.mode_set(mode='EDIT')
+                context.tool_settings.mesh_select_mode = (False, False, True)
+                bm = bmesh.from_edit_mesh(obj.data)
+                bm.verts.ensure_lookup_table()
+                bm.edges.ensure_lookup_table()
+                bm.faces.ensure_lookup_table()
+                _clear_selection(bm)
+                bm.select_history.clear()
+                for index in indices:
+                    bm.faces[index].select_set(True)
+                bm.faces.active = bm.faces[indices[0]]
+                bm.normal_update()
+                bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+        message = (f'UV 缩点检查完成：{len(findings)} 个问题物体，{count} 个问题面。'
+                   if findings else 'UV 缩点检查完成：未发现 UV 缩成一点的面。')
+        if missing_uv:
+            message += f' {missing_uv} 个物体没有 UV，已跳过。'
+        if skipped:
+            message += f' {skipped} 个物体不可编辑，已跳过。'
+        overlay.show_check_feedback(context, message, 'INFO' if findings else 'WARNING')
+        self.report({'INFO'}, message)
+        _tag_viewports(context)
+        return {'FINISHED'}
+
+
 class MC_OT_check_ngons(bpy.types.Operator):
     bl_idname = "mesh.model_checker_check_ngons"
     bl_label = "检查多边面"
@@ -433,12 +619,12 @@ class MC_OT_toggle_uv_overlay(bpy.types.Operator):
     uv_stretch_base_color: FloatVectorProperty(name="无拉伸颜色", subtype='COLOR', size=3, default=(0.43, 0.78, 1.0), min=0.0, max=1.0)
     uv_stretch_max_color: FloatVectorProperty(name="拉伸颜色", subtype='COLOR', size=3, default=(1.0, 0.0, 0.0), min=0.0, max=1.0)
     uv_stretch_strength: FloatProperty(name="拉伸显示强度", default=2.0, min=0.25, max=8.0)
-    uv_stretch_threshold: FloatProperty(name="可接受拉伸阈值", default=0.0, min=0.0, max=0.999, subtype='PERCENTAGE')
+    uv_stretch_threshold: FloatProperty(name="可接受拉伸阈值", default=0.2, min=0.0, max=0.999, subtype='PERCENTAGE')
     uv_stretch_opacity: FloatProperty(name="热力图透明度", default=0.85, min=0.0, max=1.0)
     uv_boundary_color: FloatVectorProperty(name="边界颜色", subtype='COLOR', size=3, default=(1.0, 0.55, 0.08), min=0.0, max=1.0)
     uv_boundary_width: FloatProperty(name="分界线粗细", default=4.0, min=1.0, max=12.0)
     uv_checker_opacity: FloatProperty(name="棋盘格透明度", default=0.75, min=0.0, max=1.0)
-    uv_checker_density: IntProperty(name="棋盘格密度", default=8, min=1, max=256)
+    uv_checker_density: IntProperty(name="棋盘格密度", default=64, min=1, max=256)
     uv_checker_color_a: FloatVectorProperty(name="棋盘格颜色 A", subtype='COLOR', size=3, default=(0.95, 0.95, 0.95), min=0.0, max=1.0)
     uv_checker_color_b: FloatVectorProperty(name="棋盘格颜色 B", subtype='COLOR', size=3, default=(0.12, 0.12, 0.12), min=0.0, max=1.0)
     uv_checker_pattern: EnumProperty(
@@ -453,7 +639,7 @@ class MC_OT_toggle_uv_overlay(bpy.types.Operator):
     )
     uv_orientation_front_color: FloatVectorProperty(name="正向颜色", subtype='COLOR', size=3, default=(0.43, 0.78, 1.0), min=0.0, max=1.0)
     uv_orientation_back_color: FloatVectorProperty(name="反向颜色", subtype='COLOR', size=3, default=(0.94, 0.045, 0.055), min=0.0, max=1.0)
-    uv_orientation_opacity: FloatProperty(name="UV 正反透明度", default=0.9, min=0.0, max=1.0)
+    uv_orientation_opacity: FloatProperty(name="UV 正反透明度", default=0.8, min=0.0, max=1.0)
 
     @classmethod
     def poll(cls, context):
@@ -562,7 +748,7 @@ class MC_OT_toggle_uv_overlay(bpy.types.Operator):
 class MC_OT_uv_checks(bpy.types.Operator):
     bl_idname = "mesh.model_checker_uv_checks"
     bl_label = "UV 综合检查"
-    bl_description = "点击开启检查，再次点击全部关闭；左下角可分别勾选显示项"
+    bl_description = "切换 UV 拉伸、正反和棋盘格；左下角可分别勾选这三项"
     bl_options = {'REGISTER', 'UNDO'}
     uv_controls_initializing: BoolProperty(default=False, options={'HIDDEN', 'SKIP_SAVE'})
     uv_display_mode: EnumProperty(name='显示方式', items=(
@@ -580,7 +766,7 @@ class MC_OT_uv_checks(bpy.types.Operator):
         prefs = _read_preferences(context)
         if prefs is None:
             return {'CANCELLED'}
-        self.enabled = not any((prefs.uv_show_stretch,prefs.uv_show_orientation,prefs.uv_show_checker))
+        self.enabled = not any((prefs.uv_show_stretch, prefs.uv_show_orientation, prefs.uv_show_checker))
         self._prepare(prefs)
         return self.execute(context)
 
@@ -601,11 +787,11 @@ class MC_OT_uv_checks(bpy.types.Operator):
             return {'CANCELLED'}
         if not self.properties.is_property_set('uv_display_mode'):
             if not self.properties.is_property_set('enabled'):
-                self.enabled = not any((prefs.uv_show_stretch,prefs.uv_show_orientation,prefs.uv_show_checker))
+                self.enabled = not any((prefs.uv_show_stretch, prefs.uv_show_orientation, prefs.uv_show_checker))
             self._prepare(prefs)
-        _apply_uv_display(self,prefs,context)
+        _apply_uv_display(self, prefs, context)
         _tag_viewports(context)
-        active = any((prefs.uv_show_stretch,prefs.uv_show_orientation,prefs.uv_show_checker))
+        active = any((prefs.uv_show_stretch, prefs.uv_show_orientation, prefs.uv_show_checker))
         self.report({'INFO'}, "UV 综合检查已开启，可在左下角选择显示项" if active else "UV 综合检查已关闭")
         return {'FINISHED'}
 

@@ -59,7 +59,7 @@ def suspend_for_save():
                     mesh.attributes.remove(attr)
     for scene in bpy.data.scenes:
         if hasattr(scene, 'model_checker_state'):
-            scene.model_checker_state.uv_native_scratch = None
+            scene.model_checker_state.uv_native_scratch = ''
             for item in scene.model_checker_state.uv_mesh_states:
                 item.native_signature = ''
 
@@ -69,12 +69,14 @@ def _mesh_snapshot(mesh):
     if not mesh.is_editmode:
         return mesh
     state = bpy.context.scene.model_checker_state
-    snapshot = state.uv_native_scratch
-    if snapshot is None:
-        snapshot = bpy.data.meshes.get(PREFIX + ' Scratch')
+    snapshot = bpy.data.meshes.get(state.uv_native_scratch)
+    if snapshot is None or not snapshot.get('uvmm_native_scratch', False) or snapshot.users:
+        snapshot = next((mesh for mesh in bpy.data.meshes
+                         if mesh.get('uvmm_native_scratch', False) and not mesh.users), None)
         if snapshot is None:
             snapshot = bpy.data.meshes.new(PREFIX + ' Scratch')
-        state.uv_native_scratch = snapshot
+            snapshot['uvmm_native_scratch'] = True
+        state.uv_native_scratch = snapshot.name
     bm = bmesh.from_edit_mesh(mesh)
     bm.verts.ensure_lookup_table()
     bm.edges.ensure_lookup_table()
@@ -308,7 +310,25 @@ def _update_uniforms(mat, prefs):
             node.inputs[0].default_value = prefs.uv_checker_opacity
 
 
+def update_material_uniforms(prefs):
+    """Update cached preview shader inputs without walking scene meshes."""
+    updated = set()
+    for scene in bpy.data.scenes:
+        if not hasattr(scene, 'model_checker_state'):
+            continue
+        for item in scene.model_checker_state.uv_native_materials:
+            material = bpy.data.materials.get(item.material)
+            if (material is None or material.as_pointer() in updated
+                    or not material.get('uvmm_native_preview', False)
+                    or not material.use_nodes):
+                continue
+            _update_uniforms(material, prefs)
+            updated.add(material.as_pointer())
+
+
 def _material(source, uv_name, prefs, state):
+    source_key = repr((source.session_uid, source.name_full,
+                       source.library.filepath if source.library else '')) if source else ''
     key = repr((uv_name, prefs.uv_show_checker, prefs.uv_show_stretch,
                 prefs.uv_show_orientation, prefs.uv_checker_pattern,
                 prefs.uv_checker_custom_image))
@@ -320,17 +340,20 @@ def _material(source, uv_name, prefs, state):
         prefs.uv_checker_custom_image, prefs.uv_checker_opacity,
         tuple(prefs.uv_checker_color_a), tuple(prefs.uv_checker_color_b)))
     for item in state.uv_native_materials:
-        if item.source == source and item.key == key and item.material:
+        material = bpy.data.materials.get(item.material)
+        if (item.source == source_key and item.key == key and material is not None
+                and material.get('uvmm_native_preview', False)):
             if item.signature != signature:
-                _update_uniforms(item.material, prefs)
+                _update_uniforms(material, prefs)
                 item.signature = signature
-            return item.material
+            return material
     item = state.uv_native_materials.add()
-    item.source = source
+    item.source = source_key
     item.key = key
     item.signature = signature
-    item.material = _build_material(source, uv_name, prefs)
-    return item.material
+    material = _build_material(source, uv_name, prefs)
+    item.material = material.name
+    return material
 
 
 def ensure_preview(obj, prefs, dirty=False):
@@ -343,7 +366,8 @@ def ensure_preview(obj, prefs, dirty=False):
     signature = repr((mesh.uv_layers.active.name, prefs.uv_show_stretch,
                       prefs.uv_show_orientation, tuple(v for row in obj.matrix_world for v in row)))
     changed_style_or_transform = entry.native_signature != signature
-    if dirty or changed_style_or_transform or entry.native_force_refresh:
+    needs_metrics = prefs.uv_show_stretch or prefs.uv_show_orientation
+    if needs_metrics and (dirty or changed_style_or_transform or entry.native_force_refresh):
         source_mesh = _mesh_snapshot(mesh)
         source = diagnostic.mesh_source_signature(source_mesh)
         changed_inputs = source != entry.native_source_signature
@@ -351,6 +375,12 @@ def ensure_preview(obj, prefs, dirty=False):
                 changed_inputs or changed_style_or_transform or entry.native_force_refresh):
             _write_metrics(obj, prefs, changed_inputs or entry.native_force_refresh, source_mesh)
         entry.native_source_signature = source
+        entry.native_signature = signature
+        entry.native_force_refresh = False
+    elif not needs_metrics:
+        # A checker-only preview samples the active UV map directly in its
+        # material. It does not need mesh signatures or CPU diagnostic metrics.
+        entry.native_source_signature = ''
         entry.native_signature = signature
         entry.native_force_refresh = False
     return _prepare_bindings(obj, prefs)
@@ -387,7 +417,7 @@ def _prepare_bindings(obj, prefs):
         return True
     remove_preview(obj)
     group = next((g for g in bpy.data.node_groups
-                  if g.get('uvmm_native_preview', False) and g.users == 0
+                  if g.get('uvmm_native_preview', False)
                   and g.get('uvmm_binding') == binding), None)
     if group is not None:
         modifier = obj.modifiers.new('UV 检查 · 材质预览（临时）', 'NODES')

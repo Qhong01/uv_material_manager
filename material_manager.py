@@ -829,6 +829,33 @@ class MATERIAL_MT_TemplateLibraryMenu(bpy.types.Menu):
             op.template_name = name
 
 
+def _node_tree_position(node):
+    position = node.location.copy()
+    parent = node.parent
+    while parent is not None:
+        position += parent.location
+        parent = parent.parent
+    return position
+
+
+def _position_synced_nodes(source_nodes, node_mapping, original_nodes):
+    # Use horizontal bounds so tall shader nodes cannot overlap the original
+    # graph even when Blender has not measured their displayed heights yet.
+    original_left = min(_node_tree_position(node).x for node in original_nodes)
+    source_right = max(
+        _node_tree_position(node).x + max(node.width, node.dimensions.x)
+        for node in source_nodes
+    )
+    offset_x = original_left - 240.0 - source_right
+    for source in source_nodes:
+        target = node_mapping[source.name]
+        parent = node_mapping.get(source.parent.name) if source.parent else None
+        target.parent = parent
+        target.location = source.location if parent else _node_tree_position(source)
+        if parent is None:
+            target.location.x += offset_x
+
+
 class MATERIAL_OT_SyncShaderData(Operator):
     bl_idname = "material.sync_shader_pro"
     bl_label = "同步材质数据"
@@ -939,6 +966,7 @@ class MATERIAL_OT_SyncShaderData(Operator):
                         target_mat.node_tree.links.remove(link)
 
                 # 复制源材质的着色器节点到目标材质
+                original_nodes = list(target_mat.node_tree.nodes)
                 node_mapping = {}
                 for src_node in src_nodes_to_copy:
                     new_node = target_mat.node_tree.nodes.new(src_node.bl_idname)
@@ -950,7 +978,9 @@ class MATERIAL_OT_SyncShaderData(Operator):
 
                     # 复制可写属性
                     for prop in src_node.bl_rna.properties:
-                        if prop.is_readonly or prop.identifier in ['inputs', 'outputs']:
+                        if prop.is_readonly or prop.identifier in {
+                            'inputs', 'outputs', 'parent', 'location', 'name'
+                        }:
                             continue
                         try:
                             setattr(new_node, prop.identifier, getattr(src_node, prop.identifier))
@@ -966,6 +996,8 @@ class MATERIAL_OT_SyncShaderData(Operator):
                                     dst_input.default_value = src_input.default_value
                             except Exception:
                                 pass
+
+                _position_synced_nodes(src_nodes_to_copy, node_mapping, original_nodes)
 
                 # 复制节点之间的连线关系
                 for link in src_mat.node_tree.links:

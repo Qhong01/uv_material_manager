@@ -18,8 +18,9 @@ def _prefs():
     return bpy.context.preferences.addons["uv_material_manager"].preferences
 
 
-def _set_mode(stretch=False, orientation=False, checker=False):
+def _set_mode(stretch=False, orientation=False, checker=False, display_mode='CLASSIC'):
     prefs = _prefs()
+    prefs.uv_display_mode = display_mode
     prefs.uv_show_checker = checker
     prefs.uv_show_stretch = stretch
     prefs.uv_show_orientation = orientation
@@ -251,7 +252,7 @@ def test_degenerate_uv_maps_to_full_stretch(ctx):
 
 
 def test_checker_preview_is_shared(ctx):
-    _set_mode(checker=True)
+    _set_mode(checker=True, display_mode='MATERIAL')
     try:
         ctx.reset_scene()
         objects = [ctx.add_grid(name=f"checker_{index}") for index in range(4)]
@@ -281,6 +282,126 @@ def test_checker_preview_is_shared(ctx):
     finally:
         _set_mode()
         diagnostic.refresh_timer()
+
+
+def test_checker_only_preview_skips_mesh_signature(ctx):
+    from uv_material_manager.model_checker import native_preview
+
+    prefs = _prefs()
+    _set_mode(checker=True)
+    try:
+        ctx.reset_scene()
+        obj = ctx.add_grid(name="checker_only")
+        original_signature = diagnostic.mesh_source_signature
+
+        def unexpected_signature(_mesh):
+            raise AssertionError("checker-only preview must not scan mesh diagnostic inputs")
+
+        diagnostic.mesh_source_signature = unexpected_signature
+        try:
+            assert native_preview.ensure_preview(obj, prefs, dirty=True)
+        finally:
+            diagnostic.mesh_source_signature = original_signature
+    finally:
+        _set_mode()
+
+
+def test_material_style_change_updates_shader_without_full_refresh(ctx):
+    from uv_material_manager.model_checker import native_preview
+
+    prefs = _prefs()
+    _set_mode(stretch=True, orientation=True, checker=True, display_mode='MATERIAL')
+    try:
+        ctx.reset_scene()
+        obj = ctx.add_grid(name="material_style")
+        source = bpy.data.materials.new("material_style_source")
+        obj.data.materials.append(source)
+        assert native_preview.ensure_preview(obj, prefs, dirty=True)
+
+        state = bpy.context.scene.model_checker_state
+        from uv_material_manager.model_checker import _sync_scene_overlay
+        _sync_scene_overlay(bpy.context.scene, prefs, force_refresh=False)
+        state.uv_display_dirty = False
+        state.uv_display_full_refresh = False
+
+        old_strength = prefs.uv_stretch_strength
+        prefs.uv_stretch_strength = old_strength + 0.25
+
+        assert not state.uv_display_dirty, "材质显示参数变化不应触发整场景刷新"
+        strength_nodes = [
+            node for node in bpy.data.materials
+            if node.get('uvmm_native_preview', False) and node.use_nodes
+            for node in node.node_tree.nodes
+            if node.get('uvmm_role') == 'strength'
+        ]
+        assert strength_nodes, "测试材质中应有拉伸强度节点"
+        assert abs(strength_nodes[0].inputs[1].default_value - 1.0 / prefs.uv_stretch_strength) < 1e-6
+    finally:
+        _set_mode()
+
+
+def test_complex_scene_preview_reuses_material_pipeline(ctx):
+    from uv_material_manager.model_checker import native_preview
+
+    _set_mode(stretch=True, orientation=True, checker=True, display_mode='MATERIAL')
+    try:
+        ctx.reset_scene()
+        source = bpy.data.materials.new("complex_scene_shared_source")
+        objects = []
+        for index in range(12):
+            obj = ctx.add_grid(name=f"complex_scene_{index:02d}",
+                               x_segments=64, y_segments=64, size=2.0)
+            obj.data.materials.append(source)
+            obj.location.x = index * 2.5
+            objects.append(obj)
+
+        diagnostic.stop_refresh_timer()
+        state = bpy.context.scene.model_checker_state
+        diagnostic.mark_full_refresh(state)
+        native_preview.prepare_display(bpy.context, _prefs())
+        for _attempt in range(500):
+            interval = diagnostic.refresh_timer()
+            if interval is None and not state.uv_display_dirty:
+                break
+
+        preview_modifiers = [native_preview.modifier_for(obj) for obj in objects]
+        assert all(preview_modifiers), "复杂场景中的每个可见模型都应有预览绑定"
+        groups = {modifier.node_group.as_pointer() for modifier in preview_modifiers}
+        assert len(groups) == 1, "相同材质组合应共享节点组，避免每个模型重复建立评估节点树"
+        assert not state.uv_display_dirty, "复杂场景刷新应完成且不进入轮询重算"
+    finally:
+        _set_mode()
+
+
+def test_mesh_change_refreshes_only_that_mesh(ctx):
+    from uv_material_manager.model_checker import native_preview
+
+    _set_mode(stretch=True, orientation=True, checker=True, display_mode='MATERIAL')
+    try:
+        ctx.reset_scene()
+        first = ctx.add_grid(name="changed_mesh")
+        second = ctx.add_grid(name="untouched_mesh")
+        diagnostic.stop_refresh_timer()
+        state = bpy.context.scene.model_checker_state
+        diagnostic.mark_full_refresh(state)
+        native_preview.prepare_display(bpy.context, _prefs())
+        for _attempt in range(50):
+            interval = diagnostic.refresh_timer()
+            if interval is None and not state.uv_display_dirty:
+                break
+
+        unchanged_write_time = second.data.get(diagnostic._COLOR_WRITE_TIME_KEY)
+        uv = first.data.uv_layers.active.data[0].uv.copy()
+        first.data.uv_layers.active.data[0].uv = (uv.x + 0.05, uv.y)
+        diagnostic.mark_mesh_dirty(state, first.data, force=True)
+        diagnostic.refresh_timer()
+
+        assert first.data.get(diagnostic._COLOR_WRITE_TIME_KEY) != unchanged_write_time
+        assert second.data.get(diagnostic._COLOR_WRITE_TIME_KEY) == unchanged_write_time, (
+            "未变化的网格不应被重新写入诊断数据"
+        )
+    finally:
+        _set_mode()
 
 
 def test_full_refresh_leaves_no_attribute_when_disabled(ctx):

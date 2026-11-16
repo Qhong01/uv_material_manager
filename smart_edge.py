@@ -29,14 +29,8 @@ def _is_closed_edge_loop(edges):
     return visited == edge_set
 
 
-def _is_quad_diagonal(edge):
-    if len(edge.link_faces) != 2:
-        return False
-    first_face, second_face = edge.link_faces
-    if len(first_face.verts) != 3 or len(second_face.verts) != 3:
-        return False
-    quad_verts = set(first_face.verts) | set(second_face.verts)
-    return len(quad_verts) == 4
+def _is_face_diagonal(edge):
+    return edge.is_manifold and all(not face.hide for face in edge.link_faces)
 
 
 def _connect_selected_verts_to_active(bm, selected_verts):
@@ -153,15 +147,29 @@ class MESH_OT_uvmm_smart_edge(Operator):
             if selected_faces:
                 return bpy.ops.mesh.region_to_loop()
 
-            if len(selected_edges) == 1 and _is_quad_diagonal(selected_edges[0]):
-                return bpy.ops.mesh.edge_rotate(use_ccw=True)
+            if len(selected_edges) == 1 and _is_face_diagonal(selected_edges[0]):
+                result = bmesh.ops.rotate_edges(bm, edges=selected_edges, use_ccw=True)
+                rotated_edges = result.get('edges', ())
+                if not rotated_edges:
+                    self.report({'WARNING'}, "当前拓扑无法切换这条内部边")
+                    return {'CANCELLED'}
+                bm.select_history.clear()
+                for vert in selected_verts:
+                    vert.select_set(False)
+                for edge in rotated_edges:
+                    edge.select_set(True)
+                    bm.select_history.add(edge)
+                bm.select_flush_mode()
+                bm.normal_update()
+                bmesh.update_edit_mesh(obj.data, loop_triangles=True, destructive=True)
+                return {'FINISHED'}
 
             if _is_closed_edge_loop(selected_edges):
                 return bpy.ops.mesh.loop_to_region(select_bigger=False)
 
         self.report(
             {'INFO'},
-            "请在顶点模式选择多个顶点，或在边模式选择四边面内部边/闭合边环",
+            "请在顶点模式选择多个顶点，或在边模式选择相邻面之间的内部边/闭合边环",
         )
         return {'CANCELLED'}
 

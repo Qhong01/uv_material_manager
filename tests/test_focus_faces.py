@@ -7,8 +7,8 @@ import bmesh
 import bpy
 
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import focus_tools
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from uv_material_manager import focus_tools
 
 
 def faces(obj):
@@ -60,6 +60,16 @@ with bpy.context.temp_override(area=area, region=region):
     bmesh.update_edit_mesh(obj.data)
     assert bpy.ops.view3d.uvmm_restore_hidden_level() == {'FINISHED'}
     assert all(not face.hide for face in faces(obj))
+
+    faces(obj)[0].select_set(True)
+    bmesh.update_edit_mesh(obj.data)
+    assert bpy.ops.view3d.uvmm_restore_hidden_level() == {'FINISHED'}
+    assert faces(obj)[0].hide
+    assert len(bpy.context.scene.uvmm_focus_face_stack.levels) == 1
+    assert bpy.ops.mesh.reveal(select=False) == {'FINISHED'}
+    bpy.context.view_layer.update()
+    assert all(not face.hide for face in faces(obj))
+    assert len(bpy.context.scene.uvmm_focus_face_stack.levels) == 0
 
 assert len(bpy.context.scene.uvmm_focus_face_stack.levels) == 0
 bpy.ops.object.mode_set(mode='OBJECT')

@@ -28,10 +28,66 @@ def _comparison_threshold():
 class M_Cleaner:
 
     @staticmethod
+    def clear_duplicate_material_slots(objects, context):
+        """Remove repeated slots that reference the exact same material datablock."""
+        removed = 0
+        processed_meshes = set()
+        for obj in objects:
+            if obj.type != 'MESH' or obj.library or obj.data is None:
+                continue
+            mesh = obj.data
+            object_link_duplicates = []
+            data_link_duplicates = []
+            seen = {}
+            for index, slot in enumerate(obj.material_slots):
+                material = slot.material
+                if material is None:
+                    continue
+                key = (slot.link, material.as_pointer())
+                if key in seen:
+                    (object_link_duplicates if slot.link == 'OBJECT' else data_link_duplicates).append(index)
+                else:
+                    seen[key] = index
+
+            # Mesh material slots are shared by every object using this mesh.
+            # Remove them once and let Blender remap polygon material indices.
+            mesh_key = mesh.as_pointer()
+            if mesh_key not in processed_meshes and data_link_duplicates:
+                for index in reversed(data_link_duplicates):
+                    mesh.materials.pop(index=index)
+                    for polygon in mesh.polygons:
+                        if polygon.material_index >= index:
+                            polygon.material_index = max(0, polygon.material_index - 1)
+                    removed += 1
+                processed_meshes.add(mesh_key)
+
+            # Object-linked slots are per-object and must be removed through Blender's
+            # slot operator so its polygon material indices are updated correctly.
+            for index in reversed(object_link_duplicates):
+                override = {
+                    'active_object': obj,
+                    'object': obj,
+                    'selected_objects': [obj],
+                    'selected_editable_objects': [obj],
+                }
+                if context.window:
+                    override['window'] = context.window
+                    override['screen'] = context.window.screen
+                if context.area:
+                    override['area'] = context.area
+                with context.temp_override(**override):
+                    obj.active_material_index = index
+                    result = bpy.ops.object.material_slot_remove()
+                if 'FINISHED' in result:
+                    removed += 1
+        return removed
+
+    @staticmethod
     def clear_numbered_duplicate_materials(materials):
-        """Merge Blender numeric-suffix copies into their unsuffixed material."""
+        """Merge numbered copies, restoring the base name when it is free."""
         duplicate_pattern = re.compile(r'^(?P<base>.+)\.(?P<suffix>\d{3,})$')
         removed_count = 0
+        restored_names = 0
         for duplicate in sorted(list(materials), key=lambda mat: mat.name):
             if duplicate.library:
                 continue
@@ -39,14 +95,18 @@ class M_Cleaner:
             if not match:
                 continue
             base = materials.get(match.group('base'))
-            if base is None or base is duplicate:
+            if base is None:
+                duplicate.name = match.group('base')
+                restored_names += 1
+                continue
+            if base is duplicate:
                 continue
             if duplicate.use_fake_user:
                 base.use_fake_user = True
             duplicate.user_remap(base)
             materials.remove(duplicate)
             removed_count += 1
-        return removed_count
+        return removed_count, restored_names
 
     @staticmethod
     def merge_by_name(objects, materials):
@@ -654,7 +714,7 @@ class LinkWrapper:
 class UVMM_OT_CleanDuplicateMaterials(Operator):
     bl_idname = 'uvmm.clean_duplicate_materials'
     bl_label = '清理材质'
-    bl_description = '将同名 .001 等数字后缀材质副本合并到无后缀材质'
+    bl_description = '合并同名数字后缀材质；原名称空缺时去掉 .001 等后缀，恢复原名'
     bl_options = {'REGISTER', 'UNDO'}
 
     remove_unused: BoolProperty(
@@ -668,7 +728,11 @@ class UVMM_OT_CleanDuplicateMaterials(Operator):
 
     def execute(self, context):
         materials = bpy.data.materials
-        removed_duplicates = M_Cleaner.clear_numbered_duplicate_materials(materials=materials)
+        removed_slots = M_Cleaner.clear_duplicate_material_slots(
+            objects=bpy.data.objects,
+            context=context,
+        )
+        removed_duplicates, restored_names = M_Cleaner.clear_numbered_duplicate_materials(materials=materials)
         removed_unused = 0
         if self.remove_unused:
             before = len(materials)
@@ -676,7 +740,8 @@ class UVMM_OT_CleanDuplicateMaterials(Operator):
             removed_unused = before - len(materials)
         self.report(
             {'INFO'},
-            f'清理材质完成：移除 {removed_duplicates} 个重复副本，'
+            f'清理材质完成：移除 {removed_slots} 个重复槽、{removed_duplicates} 个重复副本，'
+            f'去掉数字后缀 {restored_names} 个，'
             f'清理未使用材质 {removed_unused} 个',
         )
         return {'FINISHED'}

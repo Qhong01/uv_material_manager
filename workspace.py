@@ -880,7 +880,7 @@ def execute_toggle_layout(self_op, context, item_id="", item_name="", editor_typ
     did_un_fullscreen = False
     if getattr(screen, 'show_fullscreen', False):
         try:
-            bpy.ops.screen.back_to_previous('INVOKE_DEFAULT')
+            bpy.ops.screen.back_to_previous('EXEC_DEFAULT')
             window, screen = get_safe_window_and_screen(context)
             did_un_fullscreen = True
         except Exception:
@@ -927,11 +927,29 @@ def execute_toggle_layout(self_op, context, item_id="", item_name="", editor_typ
             self_op.report({'WARNING'}, "未找到该视图配置")
         return {'CANCELLED'}
 
+    if did_un_fullscreen:
+        # Close the old managed editor in the same operator event as leaving
+        # fullscreen. Deferring this to the split timer lets Blender redraw the
+        # old UV/editor area for one frame, causing a visible flash.
+        window, screen = get_safe_window_and_screen(context)
+        old_secondary = get_or_detect_secondary_area(
+            screen,
+            getattr(wm, "um_secondary_area_ptr", ""),
+        )
+        if old_secondary:
+            close_secondary_area(context)
+            window, screen = get_safe_window_and_screen(context)
+
     active_id = getattr(wm, "um_active_layout_id", "")
     secondary_ptr = getattr(wm, "um_secondary_area_ptr", "")
 
     # 智能查找副屏（按指针查找，或智能检测当前屏幕已存在的非3D工作区副屏）
     existing_secondary = get_or_detect_secondary_area(screen, secondary_ptr)
+    if did_un_fullscreen:
+        # The fullscreen temporary screen does not expose the underlying
+        # secondary area reliably; defer cleanup and opening to the UI timer.
+        existing_secondary = None
+        active_id = ""
 
     if existing_secondary:
         wm.um_secondary_area_ptr = hex(existing_secondary.as_pointer())
@@ -1022,6 +1040,8 @@ def execute_toggle_layout(self_op, context, item_id="", item_name="", editor_typ
             cur_window, cur_screen = get_safe_window_and_screen(bpy.context)
             if not cur_screen:
                 return
+            if did_un_fullscreen and getattr(cur_screen, 'show_fullscreen', False):
+                return 0.02
 
             cur_area = None
             view3d_areas = [a for a in cur_screen.areas if a.type == 'VIEW_3D']

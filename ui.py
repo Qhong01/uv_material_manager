@@ -2,7 +2,7 @@ import bpy
 import bmesh
 from bpy.types import Operator, Panel
 from bpy.props import FloatProperty
-from .modifier_manager import draw_modifiers_section, draw_status_tooltip
+from .modifier_manager import draw_status_tooltip
 from .uv_manager import get_uv_layer_list_source
 
 # 清除法线功能
@@ -110,11 +110,12 @@ class OBJECT_OT_AutoSmooth(Operator):
 
 # 主面板
 class VIEW3D_PT_UltimateManager(Panel):
-    bl_label = "UV & 材质管理"
+    bl_label = "常用工具"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = "UV Tools"
-    bl_order = 0  # 确保面板显示在顶部
+    bl_order = 5  # 位于材质管理和检查面板下方
+    bl_options = {'DEFAULT_CLOSED'}
 
     def draw(self, context):
         layout = self.layout
@@ -158,8 +159,13 @@ class VIEW3D_PT_UltimateManager(Panel):
         focus_row.operator("mesh.uvmm_smart_edge", text="智能边", icon='EDGESEL')
         focus_row.menu("VIEW3D_MT_uvmm_smart_edge_actions", text="", icon='DOWNARROW_HLT')
         focus_row.operator("uvmm.clean_duplicate_images", text="", icon='IMAGE_DATA')
+        focus_row.operator("material.reload_all_textures", text="", icon='FILE_REFRESH')
         focus_row.operator("uvmm.clean_duplicate_materials", text="", icon='BRUSH_DATA')
         focus_row.operator("uvmm.merge_materials_by_name", text="", icon='SORTALPHA')
+
+        alpha_row = layout.row(align=True)
+        alpha_row.operator("uvmm.generate_alpha", text="生成 Alpha", icon='IMAGE_DATA')
+        alpha_row.popover(panel="VIEW3D_PT_UVMMAlphaSettings", text="", icon='PREFERENCES')
 
         # 1. 动态自定义分屏工具栏 (第三排：只放分屏功能按键，右侧保留配置齿轮)
         from .workspace import get_editor_icon
@@ -332,18 +338,6 @@ class VIEW3D_PT_UltimateManager(Panel):
         return selected_mats        
 
 
-# 修改器管理面板
-class VIEW3D_PT_ModifierManager(Panel):
-    bl_label = "修改器"
-    bl_space_type = 'VIEW_3D'
-    bl_region_type = 'UI'
-    bl_category = "UV Tools"
-    bl_order = 1
-
-    def draw(self, context):
-        layout = self.layout
-        draw_modifiers_section(layout, context)
-
 # UV层管理面板
 class VIEW3D_PT_UVLayerManager(Panel):
     bl_label = "UV层管理"
@@ -452,18 +446,9 @@ class VIEW3D_PT_MaterialManager(Panel):
     bl_category = "UV Tools"  # 保持与主面板相同分类
     bl_order = 3  # 显示在主面板下方
 
-    def draw_header(self, context):
-        layout = self.layout
-        layout.operator("material.reload_all_textures", text="", icon='FILE_REFRESH', emboss=False)
-
     def draw(self, context):
         layout = self.layout
         props = context.scene.um_props
-        
-        # 0. 菜单最顶上一键刷新全部材质贴图
-        top_row = layout.row(align=True)
-        top_row.scale_y = 1.15
-        top_row.operator("material.reload_all_textures", text="刷新全部贴图", icon='FILE_REFRESH')
 
         # 主容器
         main_box = layout.box()
@@ -588,7 +573,6 @@ def register():
     bpy.utils.register_class(CUSTOM_OT_ClearNormals)
     bpy.utils.register_class(OBJECT_OT_AutoSmooth)
     bpy.utils.register_class(VIEW3D_PT_UltimateManager)
-    bpy.utils.register_class(VIEW3D_PT_ModifierManager)
     bpy.utils.register_class(VIEW3D_PT_UVLayerManager)
     bpy.utils.register_class(IMAGE_PT_UVManager)
     bpy.utils.register_class(IMAGE_PT_UVCheck)
@@ -600,7 +584,6 @@ def unregister():
     bpy.utils.unregister_class(IMAGE_PT_UVCheck)
     bpy.utils.unregister_class(IMAGE_PT_UVManager)
     bpy.utils.unregister_class(VIEW3D_PT_UVLayerManager)
-    bpy.utils.unregister_class(VIEW3D_PT_ModifierManager)
     bpy.utils.unregister_class(VIEW3D_PT_UltimateManager)
     bpy.utils.unregister_class(OBJECT_OT_AutoSmooth)
     bpy.utils.unregister_class(CUSTOM_OT_ClearNormals)
